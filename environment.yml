@@ -1,0 +1,23 @@
+# mol2step — reproducible conda/mamba environment
+#
+# Create and activate:
+#   mamba env create -f environment.yml
+#   mamba activate mol2step
+#
+# Update an existing environment:
+#   mamba env update -f environment.yml --prune
+
+name: mol2step
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11          # 3.11 is well-tested with cadquery; 3.12 also works
+  - cadquery=2.7.0       # wraps OpenCASCADE (OCCT) — install via conda-forge only
+  - numpy>=1.21
+  - pip
+  - pip:
+      # pure-Python extras (optional, for development)
+      - pytest            # run: pytest tests/ (if tests are added)

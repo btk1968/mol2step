@@ -1,0 +1,19 @@
+# mol2step — Python dependencies
+#
+# IMPORTANT: CadQuery depends on the OpenCASCADE kernel (OCCT).
+# The conda/mamba path below is strongly recommended over pip.
+# pip install of cadquery can fail or produce a broken OCCT on some platforms.
+#
+# Recommended installation (conda/mamba):
+#   mamba create -n mol2step python=3.11 -y
+#   mamba activate mol2step
+#   mamba install -c conda-forge cadquery -y
+#   pip install -r requirements.txt   # only installs numpy (cadquery pulls the rest)
+#
+# If you must use pip only (Linux x86-64, may work):
+#   pip install cadquery numpy
+#
+# See environment.yml for the full reproducible conda environment.
+
+cadquery>=2.4
+numpy>=1.21
