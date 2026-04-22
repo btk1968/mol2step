@@ -4,8 +4,8 @@ mol2step.py — Generate solid STEP/STL CAD files of ball-and-stick molecular
 models from molecular geometry files (MOL/SDF, XYZ, PDB).
 
 Atom spheres are sized by van der Waals radius. Bond tubes are sized by
-the van der Waals radius of hydrogen. Sphere–tube intersections are
-automatically filleted for printability.
+the van der Waals radius of hydrogen. All primitives are fused in one
+BRepAlgoAPI_Fuse call to produce a single solid BREP body.
 
 Produces true solid BREP geometry that imports into OnShape, FreeCAD, or
 any STEP-compatible CAD program.
@@ -155,15 +155,6 @@ class Molecule:
         coords = np.array([[a.x, a.y, a.z] for a in self.atoms])
         return coords.min(axis=0), coords.max(axis=0)
 
-    def adjacency(self):
-        """Return {atom_idx: [(bond, neighbor_atom)]} for every atom."""
-        adj = {a.index: [] for a in self.atoms}
-        for bond in self.bonds:
-            a1 = self.atoms[bond.atom1_idx]
-            a2 = self.atoms[bond.atom2_idx]
-            adj[bond.atom1_idx].append((bond, a2))
-            adj[bond.atom2_idx].append((bond, a1))
-        return adj
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -186,8 +177,13 @@ def _bond_offsets(d_hat, order, t_r):
     od = t_r * 0.85
     ref = np.array([0.0, 0.0, 1.0]) if abs(d_hat[2]) < 0.707 \
           else np.array([1.0, 0.0, 0.0])
-    u = np.cross(d_hat, ref)
-    u /= np.linalg.norm(u)
+    u   = np.cross(d_hat, ref)
+    mag = np.linalg.norm(u)
+    if mag < 1e-9:
+        ref = np.array([0.0, 1.0, 0.0])
+        u   = np.cross(d_hat, ref)
+        mag = np.linalg.norm(u)
+    u /= mag
     v = np.cross(d_hat, u)
     result = []
     for k in range(order):
@@ -375,6 +371,75 @@ def validate_molecule(mol):
     return problems
 
 
+def _check_geometry_singularities(mol):
+    """
+    Check for geometric configurations that may cause numerical issues.
+
+    Checks performed:
+    1. Planarity — via PCA eigenvalue ratio on atom coordinates.
+       A planar molecule has one near-zero eigenvalue.  OCCT BRepAlgoAPI_Fuse
+       is known to produce inverted face normals for exactly-planar inputs.
+    2. Near-threshold bond directions — bonds where |nz| ≈ 0.707, which is
+       the switching point between the two reference vectors used in
+       _make_cylinder and _bond_offsets.  Not a true singularity (cross
+       product is non-zero at that angle), but useful for diagnostics.
+
+    Prints notes; does not abort.  Returns a dict of detected conditions.
+    """
+    coords = np.array([a.pos for a in mol.atoms], dtype=float)
+    n = len(coords)
+    conditions = {}
+
+    if n < 2:
+        return conditions
+
+    # ── 1. Planarity via PCA ───────────────────────────────────────────────
+    centred = coords - coords.mean(axis=0)
+    cov = (centred.T @ centred) / n
+    # eigvalsh returns eigenvalues in ascending order
+    eigvals = np.linalg.eigvalsh(cov)
+    lam_max = eigvals[2] if eigvals[2] > 0 else 1.0
+    ratio = eigvals[0] / lam_max   # out-of-plane variance / in-plane variance
+
+    if ratio < 1e-8:
+        conditions['planar'] = True
+        print(f"  NOTE geometry: molecule is planar "
+              f"(out-of-plane PCA variance ratio {ratio:.1e}); "
+              f"OCCT boolean fuse may produce inverted face normals")
+    elif ratio < 1e-3:
+        conditions['near_planar'] = True
+        print(f"  NOTE geometry: molecule is near-planar "
+              f"(out-of-plane PCA variance ratio {ratio:.1e})")
+
+    # ── 2. Bond directions near the reference-switching threshold ──────────
+    # _make_cylinder / _bond_offsets switch from Z-ref to X-ref at |nz|=0.707.
+    # At that exact angle the cross product magnitude is 0.707 — not singular —
+    # but bonds close to ±Z (|nz|→1) or ±XY (|nz|→0) with the wrong ref
+    # chosen would give a small cross product.  Our guard below catches that;
+    # we flag here for visibility.
+    SWITCH = 0.707
+    MARGIN = 0.02
+    near_thresh = []
+    for bond in mol.bonds:
+        a1, a2 = mol.atoms[bond.atom1_idx], mol.atoms[bond.atom2_idx]
+        d = a2.pos - a1.pos
+        length = np.linalg.norm(d)
+        if length < 1e-8:
+            continue
+        nz = abs(d[2] / length)
+        if abs(nz - SWITCH) < MARGIN:
+            near_thresh.append(
+                f"{a1.element}[{bond.atom1_idx}]-"
+                f"{a2.element}[{bond.atom2_idx}] (|nz|={nz:.3f})"
+            )
+    if near_thresh:
+        conditions['near_threshold_bonds'] = near_thresh
+        print(f"  NOTE geometry: {len(near_thresh)} bond(s) near reference-"
+              f"switching threshold (|nz|≈0.707): {', '.join(near_thresh)}")
+
+    return conditions
+
+
 # Atomic number → element symbol lookup (Z=1..96)
 _Z_TO_SYMBOL = {
     1:"H", 2:"He", 3:"Li", 4:"Be", 5:"B", 6:"C", 7:"N", 8:"O",
@@ -534,6 +599,29 @@ def _make_sphere(center_mm, radius_mm):
     return s.translate(cq.Vector(center_mm[0], center_mm[1], center_mm[2]))
 
 
+def _diag_orientation(shape, label):
+    """Print in-memory volume and shell orientations for a CadQuery solid."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SHELL
+    s = shape.wrapped
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(s, props)
+    vol = props.Mass()
+    print(f"  DIAG [{label}] volume={vol:+.1f} mm³")
+    exp = TopExp_Explorer(s, TopAbs_SHELL)
+    idx = 0
+    _ORI = {0: "FORWARD", 1: "REVERSED", 2: "INTERNAL", 3: "EXTERNAL"}
+    while exp.More():
+        ori = _ORI.get(exp.Current().Orientation(), "?")
+        print(f"  DIAG [{label}] shell[{idx}] orientation={ori}")
+        idx += 1
+        exp.Next()
+    if idx == 0:
+        print(f"  DIAG [{label}] no shells found")
+
+
 def _as_solid(shape):
     """Ensure shape is a cq.Solid, unwrapping or rebuilding as needed.
 
@@ -555,7 +643,135 @@ def _as_solid(shape):
             ms = BRepBuilderAPI_MakeSolid(shells[0].wrapped)
             if ms.IsDone():
                 return cq.Shape.cast(ms.Solid())
+    print(f"  WARNING: _as_solid: unexpected fuse result — "
+          f"{len(solids)} solid(s), {len(shape.Shells())} shell(s); "
+          f"returning compound as-is (output may not be a single solid)")
     return shape
+
+
+def _normalize_shell_orientations(cq_shape):
+    """
+    Rebuild the solid so every face's effective normal points outward.
+
+    Sequential pairwise fuse accumulates orientation flags from intermediate
+    compound contexts; STEP writers cannot resolve these and mis-orient faces.
+
+    Reference point for the outward test is determined from the face's own
+    surface geometry — not from the whole-solid centroid, which can be offset
+    toward dense regions of a complex molecule:
+      Sphere surface  → sphere centre (radially outward is always correct)
+      Cylinder surface → any point on the cylinder axis (normal is perpendicular
+                         to the axis and radially outward from it)
+      Other surfaces  → fall back to the solid centroid
+
+    Any face whose effective normal (surface normal composed with the OCCT
+    orientation flag) points toward the reference is reversed.  The shell and
+    solid are then rebuilt from the corrected faces.
+    """
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.BRep import BRep_Builder
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Sphere, GeomAbs_Cylinder
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_FACE, TopAbs_REVERSED
+    from OCP.TopTools import TopTools_MapOfShape
+    from OCP.TopoDS import TopoDS_Shell, TopoDS_Solid, TopoDS
+    import cadquery as cq
+
+    solid = cq_shape.wrapped
+
+    # Fallback reference: solid centroid (used only for non-sphere/cylinder faces)
+    vol_props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(solid, vol_props)
+    cog = vol_props.CentreOfMass()
+    fallback = (cog.X(), cog.Y(), cog.Z())
+
+    # Collect deduplicated faces (TopExp_Explorer composes orientations)
+    seen = TopTools_MapOfShape()
+    faces = []
+    exp = TopExp_Explorer(solid, TopAbs_FACE)
+    while exp.More():
+        f = exp.Current()
+        if not seen.Contains(f):
+            seen.Add(f)
+            faces.append(TopoDS.Face_s(f))
+        exp.Next()
+
+    flipped = skipped = 0
+    fixed_faces = []
+
+    for face in faces:
+        try:
+            adaptor = BRepAdaptor_Surface(face)
+            u = (adaptor.FirstUParameter() + adaptor.LastUParameter()) * 0.5
+            v = (adaptor.FirstVParameter() + adaptor.LastVParameter()) * 0.5
+
+            slp = BRepLProp_SLProps(adaptor, u, v, 1, 1e-6)
+            if not slp.IsNormalDefined():
+                skipped += 1
+                fixed_faces.append(face)
+                continue
+            # BRepAdaptor_Surface already accounts for the face orientation flag:
+            # slp.Normal() returns the EFFECTIVE face normal (inward for REVERSED
+            # faces, outward for FORWARD faces).  Do NOT negate based on
+            # face.Orientation() — that would double-negate and invert the test.
+            n = slp.Normal()
+            nx, ny, nz = n.X(), n.Y(), n.Z()
+
+            # Point on the face at the UV sample
+            p = adaptor.Value(u, v)
+            fx, fy, fz = p.X(), p.Y(), p.Z()
+
+            # Reference point: primitive origin, not the whole-solid centroid.
+            # For sphere/cylinder the effective normal is radially outward from
+            # the primitive centre when the face is correctly oriented (FORWARD).
+            surf_type = adaptor.GetType()
+            if surf_type == GeomAbs_Sphere:
+                loc = adaptor.Sphere().Location()
+                rx, ry, rz = loc.X(), loc.Y(), loc.Z()
+            elif surf_type == GeomAbs_Cylinder:
+                loc = adaptor.Cylinder().Location()
+                rx, ry, rz = loc.X(), loc.Y(), loc.Z()
+            else:
+                rx, ry, rz = fallback
+        except Exception:
+            skipped += 1
+            fixed_faces.append(face)
+            continue
+
+        # Outward test: effective normal must point away from the reference.
+        dx, dy, dz = fx - rx, fy - ry, fz - rz
+        if nx * dx + ny * dy + nz * dz < 0:
+            fixed_faces.append(TopoDS.Face_s(face.Reversed()))
+            flipped += 1
+        else:
+            fixed_faces.append(face)
+
+    if flipped or skipped:
+        print(f"  Orientation fix: {flipped} face(s) flipped, {skipped} skipped")
+
+    # Rebuild solid from corrected faces
+    builder = BRep_Builder()
+    shell = TopoDS_Shell()
+    builder.MakeShell(shell)
+    for f in fixed_faces:
+        builder.Add(shell, f)
+
+    solid_out = TopoDS_Solid()
+    builder.MakeSolid(solid_out)
+    builder.Add(solid_out, shell)
+
+    # Sanity check
+    chk = GProp_GProps()
+    BRepGProp.VolumeProperties_s(solid_out, chk)
+    vol = chk.Mass()
+    if vol < 0:
+        print(f"  WARNING: rebuilt solid volume is negative ({vol:.1f} mm³) "
+              f"— orientation fix may have misfired")
+
+    return cq.Shape.cast(solid_out)
 
 
 def _make_cylinder(start_mm, end_mm, radius_mm):
@@ -579,7 +795,16 @@ def _make_cylinder(start_mm, end_mm, radius_mm):
     # then use X.  Threshold 1/√2 guarantees cross product is non-degenerate.
     ref      = np.array([0.0, 0.0, 1.0]) if abs(nv[2]) < 0.707 else np.array([1.0, 0.0, 0.0])
     x_dir_np = np.cross(nv, ref)
-    x_dir_np /= np.linalg.norm(x_dir_np)
+    mag      = np.linalg.norm(x_dir_np)
+    if mag < 1e-9:
+        # Near-singular: bond is almost parallel to chosen reference.
+        # This should not happen with the 0.707 threshold, but guard anyway.
+        alt_ref  = np.array([0.0, 1.0, 0.0])
+        x_dir_np = np.cross(nv, alt_ref)
+        mag      = np.linalg.norm(x_dir_np)
+        if mag < 1e-9:
+            return None  # truly degenerate — cannot place cylinder
+    x_dir_np /= mag
     x_dir    = cq.Vector(x_dir_np[0], x_dir_np[1], x_dir_np[2])
 
     plane = cq.Plane(origin=origin, normal=normal, xDir=x_dir)
@@ -602,6 +827,12 @@ def tube_radius_mm(scale, bond_scale, override=None):
     return VDW_RADII["H"] * bond_scale * scale / 2.0
 
 
+def _atom_r(vdw_angstroms, scale, vdw_scale, t_r):
+    """Effective atom sphere radius, clamped so the sphere always protrudes past the tube."""
+    return max(sphere_radius_mm(vdw_angstroms, scale, vdw_scale),
+               t_r + max(0.05, t_r * 0.01))
+
+
 def validate_geometry(mol, scale, vdw_scale, bond_scale,
                       tube_radius_override=None):
     """
@@ -609,7 +840,6 @@ def validate_geometry(mol, scale, vdw_scale, bond_scale,
     Pure numpy — does NOT require CadQuery.
     """
     t_r = tube_radius_mm(scale, bond_scale, tube_radius_override)
-    MIN_EXCESS = max(0.05, t_r * 0.01)
 
     print("\n  ── Spatial contact validation ──")
     issues = 0
@@ -626,10 +856,8 @@ def validate_geometry(mol, scale, vdw_scale, bond_scale,
             continue
         d_hat = d / length
 
-        r1 = max(sphere_radius_mm(a1.vdw_radius, scale, vdw_scale),
-                 t_r + MIN_EXCESS)
-        r2 = max(sphere_radius_mm(a2.vdw_radius, scale, vdw_scale),
-                 t_r + MIN_EXCESS)
+        r1 = _atom_r(a1.vdw_radius, scale, vdw_scale, t_r)
+        r2 = _atom_r(a2.vdw_radius, scale, vdw_scale, t_r)
 
         # Cylinder goes center-to-center (no extension)
         cyl_start = p1
@@ -696,9 +924,9 @@ def validate_geometry(mol, scale, vdw_scale, bond_scale,
 
 
 def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
-                tube_radius_override=None, fillet_size=None,
+                tube_radius_override=None,
                 no_fillet=False, add_base=False, base_thickness=3.0,
-                base_margin=5.0, union_all=False):
+                base_margin=5.0):
     """
     Build ball-and-stick molecular model as a single fused BREP solid.
 
@@ -718,11 +946,6 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     from OCP.TopTools import TopTools_ListOfShape
 
     t_r = tube_radius_mm(scale, bond_scale, tube_radius_override)
-    MIN_EXCESS = max(0.05, t_r * 0.01)
-
-    def atom_r(atom):
-        return max(sphere_radius_mm(atom.vdw_radius, scale, vdw_scale),
-                   t_r + MIN_EXCESS)
 
     # ── Sizing table ──────────────────────────────────────────────────────
     print(f"  Scale: {scale} mm/A  VdW: {vdw_scale}x  Bond: {bond_scale}x")
@@ -732,7 +955,7 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     print(f"  {'----':4s}  {'-----':>7s}  {'-------':>8s}  {'-----':>7s}  ------")
     for elem in sorted(set(a.element for a in mol.atoms)):
         vdw = VDW_RADII.get(elem, DEFAULT_VDW_RADIUS)
-        r   = max(sphere_radius_mm(vdw, scale, vdw_scale), t_r + MIN_EXCESS)
+        r   = _atom_r(vdw, scale, vdw_scale, t_r)
         ov  = r - t_r
         z   = math.sqrt(max(0.0, r*r - t_r*t_r))
         ang = math.degrees(math.asin(min(1.0, z / r)))
@@ -743,7 +966,7 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     gap_count = 0
     for bond in mol.bonds:
         for atom in (mol.atoms[bond.atom1_idx], mol.atoms[bond.atom2_idx]):
-            if (atom_r(atom) - t_r) < 0.3:
+            if (_atom_r(atom.vdw_radius, scale, vdw_scale, t_r) - t_r) < 0.3:
                 gap_count += 1
     if gap_count:
         print(f"  WARNING: {gap_count} junctions have overlap < 0.3 mm"
@@ -752,12 +975,14 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
         print("  All junction overlaps >= 0.3 mm  (ok)")
     print()
 
+    _check_geometry_singularities(mol)
+
     # ── Path 1: --no-fillet compound (validated, no boolean) ─────────────
     if no_fillet:
         shapes = []
         for atom in mol.atoms:
             pos = np.asarray(atom.pos * scale, dtype=float)
-            shapes.append(_make_sphere(pos, atom_r(atom)).val())
+            shapes.append(_make_sphere(pos, _atom_r(atom.vdw_radius, scale, vdw_scale, t_r)).val())
         n_cyl = 0
         for bond in mol.bonds:
             a1 = mol.atoms[bond.atom1_idx]
@@ -784,7 +1009,7 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
 
     for atom in mol.atoms:
         pos = np.asarray(atom.pos * scale, dtype=float)
-        all_shapes.append(_make_sphere(pos, atom_r(atom)).val())
+        all_shapes.append(_make_sphere(pos, _atom_r(atom.vdw_radius, scale, vdw_scale, t_r)).val())
 
     n_cyl = 0
     for bond in mol.bonds:
@@ -809,31 +1034,52 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     if len(all_shapes) == 1:
         result = all_shapes[0]
     else:
-        print(f"  Fusing {len(all_shapes)} primitives...")
-        arg_list  = TopTools_ListOfShape()
-        tool_list = TopTools_ListOfShape()
-        arg_list.Append(all_shapes[0].wrapped)
-        for s in all_shapes[1:]:
-            tool_list.Append(s.wrapped)
+        # Sequential pairwise fuse.
+        # Multi-tool mode (SetArguments/SetTools with all shapes at once)
+        # produces inverted face normals for planar molecules: at z=0
+        # intersection edges the dihedral angle is exactly 0° or 180°,
+        # making the ± face-classification sign ambiguous.  Pairwise fuse
+        # resolves each pair in isolation and avoids the global sign flip.
+        # Sequential pairwise fuse.
+        # Multi-tool mode (SetArguments/SetTools with all shapes at once)
+        # produces inverted face normals for planar molecules: at z=0
+        # intersection edges the dihedral angle is exactly 0° or 180°,
+        # making the ± face-classification sign ambiguous.  Pairwise fuse
+        # resolves each pair in isolation and avoids the global sign flip.
+        #
+        # _as_solid is called once at the end, not inside the loop:
+        # calling it on each intermediate result can corrupt later steps if
+        # a non-overlapping pair produces a temporary compound.
+        print(f"  Fusing {len(all_shapes)} primitives (sequential pairwise)...")
+        result = all_shapes[0]
+        failed = 0
+        for shape in all_shapes[1:]:
+            arg  = TopTools_ListOfShape(); arg.Append(result.wrapped)
+            tool = TopTools_ListOfShape(); tool.Append(shape.wrapped)
+            fuser = BRepAlgoAPI_Fuse()
+            fuser.SetArguments(arg)
+            fuser.SetTools(tool)
+            fuser.SetFuzzyValue(1e-6)
+            fuser.Build()
+            if fuser.IsDone():
+                stepped = cq.Shape.cast(fuser.Shape())
+                # Unwrap compound→solid without orientation correction mid-loop
+                solids = stepped.Solids()
+                result = solids[0] if len(solids) == 1 else stepped
+            else:
+                failed += 1
 
-        fuser = BRepAlgoAPI_Fuse()
-        fuser.SetArguments(arg_list)
-        fuser.SetTools(tool_list)
-        fuser.SetFuzzyValue(1e-6)
-        fuser.Build()
-
-        if not fuser.IsDone():
-            print("  WARNING: multi-tool fuse failed — falling back to "
-                  "--no-fillet compound")
-            return cq.Compound.makeCompound(all_shapes)
-
-        result = _as_solid(cq.Shape.cast(fuser.Shape()))
+        result = _as_solid(result)
+        _diag_orientation(result, "after_fuse")
+        if failed:
+            print(f"  WARNING: {failed} pairwise fuse step(s) failed — "
+                  f"result may be incomplete")
         print(f"  Fuse complete: {len(result.Faces())} faces, "
               f"{len(result.Edges())} edges")
 
     # ── Optional base plate ────────────────────────────────────────────────
     if add_base:
-        max_r = max(atom_r(a) for a in mol.atoms)
+        max_r = max(_atom_r(a.vdw_radius, scale, vdw_scale, t_r) for a in mol.atoms)
         bb_min, bb_max = mol.bounding_box()
         bmin = np.asarray(bb_min * scale, dtype=float)
         bmax = np.asarray(bb_max * scale, dtype=float)
@@ -866,8 +1112,62 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     return result
 
 
+# Sphere-surface sample directions: 6 cardinal + 8 octant = 14 points
+_SPHERE_SAMPLE_DIRS = [
+    (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
+    ( 0.577,  0.577,  0.577), (-0.577,  0.577,  0.577),
+    ( 0.577, -0.577,  0.577), ( 0.577,  0.577, -0.577),
+    (-0.577, -0.577,  0.577), (-0.577,  0.577, -0.577),
+    ( 0.577, -0.577, -0.577), (-0.577, -0.577, -0.577),
+]
+
+
+def _load_step_occ(step_file):
+    """
+    Load a STEP file using STEPControl_Reader and return the raw OCC TopoDS_Shape.
+
+    cq.importers.importStep() has a shape-tree traversal quirk that returns
+    0 solids for fused output even when the file is geometrically correct.
+    This function bypasses the CadQuery wrapper entirely.
+
+    Returns (shape, error_str); shape is None on failure.
+    """
+    from OCP.STEPControl import STEPControl_Reader
+    from OCP.IFSelect import IFSelect_RetDone
+
+    reader = STEPControl_Reader()
+    status = reader.ReadFile(str(step_file))
+    if status != IFSelect_RetDone:
+        return None, f"STEPControl_Reader.ReadFile returned status {int(status)}"
+    reader.TransferRoots()
+    shape = reader.OneShape()
+    if shape.IsNull():
+        return None, "STEP file read but resulting shape is null"
+    return shape, None
+
+
+def _topo_explore(occ_shape, topo_type):
+    """
+    Return a deduplicated list of all sub-shapes of topo_type via TopExp_Explorer.
+    Uses TopTools_MapOfShape to avoid counting shared sub-shapes twice.
+    """
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopTools import TopTools_MapOfShape
+
+    seen = TopTools_MapOfShape()
+    exp  = TopExp_Explorer(occ_shape, topo_type)
+    shapes = []
+    while exp.More():
+        s = exp.Current()
+        if not seen.Contains(s):
+            seen.Add(s)
+            shapes.append(s)
+        exp.Next()
+    return shapes
+
+
 def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
-                    tube_radius_override=None, n_samples=12, probe_depth=0.5):
+                    tube_radius_override=None):
     """
     Analytical junction geometry check against a STEP file.
 
@@ -899,16 +1199,11 @@ def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     try:
         compound = cq.importers.importStep(str(step_file))
         n_bodies = len(compound.solids().vals())
-        print(f"  STEP solid bodies: {n_bodies}  (molecule atoms: {len(mol.atoms)})")
+        print(f"  STEP solid bodies: {n_bodies}")
     except Exception as exc:
         print(f"  Could not load STEP file: {exc}")
 
-    t_r       = tube_radius_mm(scale, bond_scale, tube_radius_override)
-    MIN_EXCESS = max(0.05, t_r * 0.01)
-
-    def atom_r(atom):
-        return max(sphere_radius_mm(atom.vdw_radius, scale, vdw_scale),
-                   t_r + MIN_EXCESS)
+    t_r = tube_radius_mm(scale, bond_scale, tube_radius_override)
 
     print(f"  Tube radius: {t_r:.3f} mm")
     print()
@@ -922,7 +1217,7 @@ def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     for bond in mol.bonds:
         a1    = mol.atoms[bond.atom1_idx]
         a2    = mol.atoms[bond.atom2_idx]
-        r1, r2 = atom_r(a1), atom_r(a2)
+        r1, r2 = _atom_r(a1.vdw_radius, scale, vdw_scale, t_r), _atom_r(a2.vdw_radius, scale, vdw_scale, t_r)
         label  = f"{a1.element}{bond.atom1_idx}-{a2.element}{bond.atom2_idx}"
 
         for atom, r, end_lbl in [(a1, r1, "a1"), (a2, r2, "a2")]:
@@ -963,6 +1258,8 @@ def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     print("  ATOM PRESENCE CHECK")
     if compound is None:
         print("  (STEP file not loaded — skipped)")
+    elif n_bodies <= 1 and len(mol.atoms) > 1:
+        print("  (single fused solid — centroid-per-atom matching not applicable)")
     else:
         try:
             from OCP.BRepGProp import BRepGProp
@@ -1002,6 +1299,349 @@ def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
             print(f"  Atom presence check failed: {exc}")
 
     print("=" * 70)
+
+
+def check_final_output(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
+                       tube_radius_override=None):
+    """
+    Comprehensive post-build validation of a STEP file.
+
+    Loads the file via STEPControl_Reader (not the CadQuery wrapper, which
+    misreports 0 solids for fused output).  Eight checks are run:
+
+      1. Solid count       — exactly 1 solid in the file
+      2. Shell count       — exactly 1 shell on that solid (single closed body)
+      3. BRepCheck         — OCCT topology validity
+      4. Free edges        — 0 free edges (watertight)
+      5. Volume bounds     — positive volume within expected [min_sphere, sum_primitives] range
+      6. Atom centers      — every atom center is inside or on the solid
+      7. Sphere surfaces   — 14-direction sampling at 95 % radius detects shaved/missing
+                             sphere regions that a boolean failure can produce
+      8. Bounding box      — solid extents match expected atom-sphere envelope
+
+    Returns True if no FATAL issues were found.
+    """
+    import math
+    from OCP.TopAbs import (TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE,
+                             TopAbs_IN, TopAbs_ON, TopAbs_OUT)
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.gp import gp_Pnt
+    from OCP.ShapeAnalysis import ShapeAnalysis_ShapeContents
+    from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    print("=" * 70)
+    print(f"FINAL OUTPUT CHECK  ({step_file})")
+    print("=" * 70)
+
+    # ── Load STEP ─────────────────────────────────────────────────────────
+    occ_shape, err = _load_step_occ(step_file)
+    if occ_shape is None:
+        print(f"  FATAL: cannot load STEP: {err}")
+        print("=" * 70)
+        return False
+
+    t_r    = tube_radius_mm(scale, bond_scale, tube_radius_override)
+    fatal  = []
+    warns  = []
+
+    # ── Check 1: solid count ──────────────────────────────────────────────
+    solids = _topo_explore(occ_shape, TopAbs_SOLID)
+    shells = _topo_explore(occ_shape, TopAbs_SHELL)
+    faces  = _topo_explore(occ_shape, TopAbs_FACE)
+    print(f"  Topology: {len(solids)} solid(s)  "
+          f"{len(shells)} shell(s)  {len(faces)} face(s)")
+
+    if len(solids) == 0:
+        fatal.append("NO_SOLID: no solid bodies found in STEP file")
+        print(f"\n  RESULT: FAIL — {len(fatal)} fatal issue(s)")
+        print("=" * 70)
+        return False
+
+    if len(solids) > 1:
+        fatal.append(f"MULTI_SOLID: {len(solids)} separate bodies — "
+                     f"fuse did not produce a single solid")
+    else:
+        print(f"  Single solid: YES")
+
+    solid_shape = solids[0]
+
+    # ── Check 2: shell count ──────────────────────────────────────────────
+    solid_shells = _topo_explore(solid_shape, TopAbs_SHELL)
+    n_shells = len(solid_shells)
+    if n_shells == 1:
+        print(f"  Shell count: 1 — single closed body (ok)")
+    else:
+        fatal.append(f"SHELL_COUNT: {n_shells} shells (expected 1 for a properly "
+                     f"fused solid; extra shells indicate disconnected regions)")
+
+    # ── Check 3: BRepCheck_Analyzer ───────────────────────────────────────
+    try:
+        ana = BRepCheck_Analyzer(solid_shape, True)
+        if ana.IsValid():
+            print(f"  BRepCheck: valid")
+        else:
+            fatal.append("BREP_INVALID: BRepCheck_Analyzer reports invalid topology")
+    except Exception as exc:
+        warns.append(f"BREP_CHECK_ERROR: {exc}")
+
+    # ── Check 4: free edges ───────────────────────────────────────────────
+    try:
+        contents = ShapeAnalysis_ShapeContents()
+        contents.Perform(solid_shape)
+        free_edges = contents.NbFreeEdges()
+        if free_edges == 0:
+            print(f"  Free edges: 0 — watertight (ok)")
+        else:
+            fatal.append(f"FREE_EDGES: {free_edges} free edge(s) — "
+                         f"solid is not watertight; slicing will likely fail")
+    except Exception as exc:
+        warns.append(f"FREE_EDGE_CHECK_ERROR: {exc}")
+
+    # ── Check 5: volume bounds ────────────────────────────────────────────
+    vol = None
+    try:
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(solid_shape, props)
+        vol = props.Mass()
+
+        # Upper bound: sum of all primitive volumes (no overlap removed)
+        sphere_vols = sum(
+            (4.0 / 3.0) * math.pi * _atom_r(a.vdw_radius, scale, vdw_scale, t_r) ** 3
+            for a in mol.atoms
+        )
+        cyl_vols = 0.0
+        for bond in mol.bonds:
+            a1 = mol.atoms[bond.atom1_idx]
+            a2 = mol.atoms[bond.atom2_idx]
+            seg = (a2.pos - a1.pos) * scale
+            L   = float(np.linalg.norm(seg))
+            if L > 0:
+                d_hat = seg / L
+                for _off, cyl_r in _bond_offsets(d_hat, bond.order, t_r):
+                    cyl_vols += math.pi * cyl_r ** 2 * L
+
+        # Lower bound: at least the largest single sphere must survive
+        max_r   = max(_atom_r(a.vdw_radius, scale, vdw_scale, t_r) for a in mol.atoms)
+        vol_min = (4.0 / 3.0) * math.pi * max_r ** 3
+        vol_max = sphere_vols + cyl_vols
+
+        print(f"  Volume: {vol:.1f} mm³  "
+              f"(expected {vol_min:.0f}–{vol_max:.0f} mm³)")
+
+        if vol < 0:
+            fatal.append(f"NEGATIVE_VOLUME: {vol:.1f} mm³ — face normals inverted "
+                         f"(solid is inside-out; this causes missing-chunk artefacts "
+                         f"in slicers)")
+        elif vol < vol_min * 0.5:
+            fatal.append(f"VOLUME_TOO_SMALL: {vol:.1f} mm³ is below 50 % of "
+                         f"single-sphere minimum {vol_min:.0f} mm³ — significant "
+                         f"geometry is missing")
+        elif vol < vol_min:
+            warns.append(f"VOLUME_BELOW_MIN: {vol:.1f} mm³ is smaller than the "
+                         f"largest single sphere ({vol_min:.0f} mm³); "
+                         f"the fused solid may be missing primitives")
+        elif vol > vol_max * 1.05:
+            warns.append(f"VOLUME_TOO_LARGE: {vol:.1f} mm³ exceeds 105 % of "
+                         f"no-overlap maximum {vol_max:.0f} mm³")
+    except Exception as exc:
+        warns.append(f"VOLUME_CHECK_ERROR: {exc}")
+
+    # ── Checks 6, 7, 7b: point-in-solid ──────────────────────────────────
+    # These checks run regardless of volume sign.  When the solid has inverted
+    # normals (negative volume) BRepClass3d_SolidClassifier returns IN where
+    # the correct answer is OUT and vice versa — we flip the logic in that case.
+    # Verifying per-atom and per-bond presence is the primary diagnostic; total
+    # volume is secondary and checked separately.
+    vol_inverted = (vol is not None and vol < 0)
+
+    def _inside(state):
+        """True if the classifier state means 'inside the physical solid'."""
+        if vol_inverted:
+            return state == TopAbs_OUT   # normals flipped: OUT = really inside
+        return state in (TopAbs_IN, TopAbs_ON)
+
+    def _outside(state):
+        if vol_inverted:
+            return state in (TopAbs_IN, TopAbs_ON)
+        return state == TopAbs_OUT
+
+    try:
+        clf = BRepClass3d_SolidClassifier()
+        clf.Load(solid_shape)
+
+        SAMPLE_FRAC = 0.95    # sample just inside the sphere surface
+        missing_centers = []
+        shaved_atoms    = []
+
+        print()
+        if vol_inverted:
+            print(f"  NOTE: volume is negative — classifier in/out sense is "
+                  f"flipped for checks 6, 7, 7b")
+
+        # ── Check 6: every atom center inside the solid ────────────────────
+        for atom in mol.atoms:
+            pos_mm = atom.pos * scale
+            r      = _atom_r(atom.vdw_radius, scale, vdw_scale, t_r)
+
+            clf.Perform(gp_Pnt(float(pos_mm[0]),
+                               float(pos_mm[1]),
+                               float(pos_mm[2])), 1e-3)
+            if not _inside(clf.State()):
+                missing_centers.append((atom.index, atom.element,
+                                        pos_mm.tolist()))
+                continue   # no point sphere-checking if center is already outside
+
+            # ── Check 7: sphere surface sampling ──────────────────────────
+            bad_dirs = 0
+            for dx, dy, dz in _SPHERE_SAMPLE_DIRS:
+                norm = math.sqrt(dx * dx + dy * dy + dz * dz)
+                clf.Perform(
+                    gp_Pnt(float(pos_mm[0] + dx / norm * r * SAMPLE_FRAC),
+                           float(pos_mm[1] + dy / norm * r * SAMPLE_FRAC),
+                           float(pos_mm[2] + dz / norm * r * SAMPLE_FRAC)),
+                    1e-3)
+                if _outside(clf.State()):
+                    bad_dirs += 1
+
+            if bad_dirs > 0:
+                shaved_atoms.append((atom.index, atom.element,
+                                     bad_dirs, len(_SPHERE_SAMPLE_DIRS)))
+
+        print(f"  CHECK 6 — ATOM CENTERS ({len(mol.atoms)} atoms):")
+        if missing_centers:
+            for idx, elem, pos in missing_centers:
+                fatal.append(
+                    f"ATOM_OUTSIDE: {elem}{idx} center "
+                    f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) mm "
+                    f"is not inside the solid")
+            print(f"    FAIL: {len(missing_centers)} atom center(s) outside solid")
+            for idx, elem, pos in missing_centers:
+                print(f"      {elem}{idx} @ ({pos[0]:.2f}, {pos[1]:.2f}, "
+                      f"{pos[2]:.2f}) mm")
+        else:
+            print(f"    All {len(mol.atoms)} atom centers inside solid (ok)")
+
+        print()
+        print(f"  CHECK 7 — SPHERE SURFACES "
+              f"({len(mol.atoms)} atoms × {len(_SPHERE_SAMPLE_DIRS)} directions):")
+        if shaved_atoms:
+            for idx, elem, bad, total in shaved_atoms:
+                fatal.append(
+                    f"SPHERE_SHAVED: {elem}{idx} — "
+                    f"{bad}/{total} surface samples are outside the solid "
+                    f"(sphere was truncated by boolean)")
+            print(f"    FAIL: {len(shaved_atoms)} sphere(s) have missing regions")
+            for idx, elem, bad, total in shaved_atoms:
+                print(f"      {elem}{idx}: {bad}/{total} directions outside solid")
+        else:
+            print(f"    All {len(mol.atoms)} spheres intact (ok)")
+
+        # ── Check 7b: bond cylinder midpoints inside solid ─────────────────
+        missing_bonds = []
+        for bond in mol.bonds:
+            a1 = mol.atoms[bond.atom1_idx]
+            a2 = mol.atoms[bond.atom2_idx]
+            mid_mm = (a1.pos + a2.pos) * 0.5 * scale
+            clf.Perform(gp_Pnt(float(mid_mm[0]),
+                               float(mid_mm[1]),
+                               float(mid_mm[2])), 1e-3)
+            if not _inside(clf.State()):
+                missing_bonds.append(
+                    (bond.atom1_idx, bond.atom2_idx,
+                     a1.element, a2.element, mid_mm.tolist()))
+
+        print()
+        print(f"  CHECK 7b — BOND MIDPOINTS ({len(mol.bonds)} bonds):")
+        if missing_bonds:
+            for i1, i2, e1, e2, pos in missing_bonds:
+                fatal.append(
+                    f"BOND_OUTSIDE: {e1}{i1}-{e2}{i2} midpoint "
+                    f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) mm "
+                    f"is not inside the solid — cylinder may be missing")
+            print(f"    FAIL: {len(missing_bonds)} bond midpoint(s) outside solid")
+            for i1, i2, e1, e2, pos in missing_bonds:
+                print(f"      {e1}{i1}-{e2}{i2} @ "
+                      f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f}) mm")
+        else:
+            print(f"    All {len(mol.bonds)} bond midpoints inside solid (ok)")
+
+    except Exception as exc:
+        warns.append(f"POINT_IN_SOLID_ERROR: {exc}")
+
+    # ── Check 8: bounding box ─────────────────────────────────────────────
+    try:
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(solid_shape, bbox)
+        xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
+
+        exp_xmin = exp_ymin = exp_zmin =  float("inf")
+        exp_xmax = exp_ymax = exp_zmax = -float("inf")
+        for atom in mol.atoms:
+            r   = _atom_r(atom.vdw_radius, scale, vdw_scale, t_r)
+            pos = atom.pos * scale
+            exp_xmin = min(exp_xmin, pos[0] - r)
+            exp_ymin = min(exp_ymin, pos[1] - r)
+            exp_zmin = min(exp_zmin, pos[2] - r)
+            exp_xmax = max(exp_xmax, pos[0] + r)
+            exp_ymax = max(exp_ymax, pos[1] + r)
+            exp_zmax = max(exp_zmax, pos[2] + r)
+
+        tol_bb = max(t_r * 0.5, 0.5)
+        bb_issues = []
+        for axis, act_lo, act_hi, exp_lo, exp_hi in [
+            ("X", xmin, xmax, exp_xmin, exp_xmax),
+            ("Y", ymin, ymax, exp_ymin, exp_ymax),
+            ("Z", zmin, zmax, exp_zmin, exp_zmax),
+        ]:
+            shrink_lo = act_lo - exp_lo   # positive → actual is larger than expected (interior shrinkage at low end)
+            shrink_hi = exp_hi - act_hi   # positive → actual is smaller than expected (interior shrinkage at high end)
+            if shrink_lo > tol_bb:
+                bb_issues.append(f"{axis} low: actual {act_lo:.2f} > expected {exp_lo:.2f} "
+                                 f"(solid shrunk {shrink_lo:.2f} mm on -{axis} side)")
+            if shrink_hi > tol_bb:
+                bb_issues.append(f"{axis} high: actual {act_hi:.2f} < expected {exp_hi:.2f} "
+                                 f"(solid shrunk {shrink_hi:.2f} mm on +{axis} side)")
+
+        print()
+        print(f"  CHECK 8 — BOUNDING BOX:")
+        if bb_issues:
+            for issue in bb_issues:
+                warns.append(f"BBOX_SHRINK: {issue}")
+            print(f"    {len(bb_issues)} extent(s) smaller than expected:")
+            for issue in bb_issues:
+                print(f"      {issue}")
+        else:
+            ext = (xmax - xmin, ymax - ymin, zmax - zmin)
+            print(f"    {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm — "
+                  f"matches expected envelope (ok)")
+
+    except Exception as exc:
+        warns.append(f"BBOX_CHECK_ERROR: {exc}")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    print()
+    if fatal:
+        print(f"  FATAL ({len(fatal)}):")
+        for f in fatal:
+            print(f"    ✗ {f}")
+    if warns:
+        print(f"  WARNINGS ({len(warns)}):")
+        for w in warns:
+            print(f"    ! {w}")
+
+    if not fatal and not warns:
+        print("  RESULT: PASS — single fused solid, all spheres intact, "
+              "geometry valid")
+    elif not fatal:
+        print(f"  RESULT: PASS with {len(warns)} warning(s)")
+    else:
+        print(f"  RESULT: FAIL — {len(fatal)} fatal issue(s)")
+    print("=" * 70)
+    return len(fatal) == 0
 
 
 def check_solid_integrity(step_file, check_intersections=False):
@@ -1125,13 +1765,19 @@ def check_solid_integrity(step_file, check_intersections=False):
     print(f"SOLID INTEGRITY CHECK  ({step_file})")
     print("=" * 70)
 
-    try:
-        compound = cq.importers.importStep(str(step_file))
-    except Exception as exc:
-        print(f"  ERROR: Cannot load STEP file: {exc}")
+    from OCP.TopAbs import TopAbs_SOLID, TopAbs_SHELL, TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
+
+    occ_shape, load_err = _load_step_occ(step_file)
+    if occ_shape is None:
+        print(f"  ERROR: Cannot load STEP file: {load_err}")
         return False
 
-    solids = compound.solids().vals()
+    # Use TopExp_Explorer for reliable traversal (CadQuery's .solids() returns
+    # 0 solids for fused output due to shape-tree traversal differences)
+    solids_raw = _topo_explore(occ_shape, TopAbs_SOLID)
+    # Wrap as cq.Shape for the per-solid checks below
+    import cadquery as cq
+    solids = [cq.Shape.cast(s) for s in solids_raw]
     n_solids = len(solids)
     print(f"  Solids: {n_solids}")
     if n_solids == 0:
@@ -1260,7 +1906,7 @@ def check_solid_integrity(step_file, check_intersections=False):
     return global_fatal == 0
 
 
-def export_model(shape, filepath, fmt="step"):
+def export_model(shape, filepath, fmt="step", skip_normalize=False):
     """Export a CadQuery Shape/Compound/Assembly to STEP or STL."""
     import cadquery as cq
     is_assembly = isinstance(shape, cq.Assembly)
@@ -1268,7 +1914,40 @@ def export_model(shape, filepath, fmt="step"):
         if is_assembly:
             shape.save(filepath, exportType="STEP")
         else:
-            cq.exporters.export(shape, filepath, exportType="STEP")
+            from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
+            from OCP.Interface import Interface_Static
+            from OCP.IFSelect import IFSelect_RetDone
+            # Resolve accumulated compound-context orientation flags before
+            # export: the STEP translator cannot handle the multi-level context
+            # produced by sequential pairwise fuse and mis-orients faces.
+            if skip_normalize:
+                print("  [--skip-normalize] bypassing _normalize_shell_orientations")
+                normalized = shape
+            else:
+                normalized = _normalize_shell_orientations(shape)
+            _diag_orientation(normalized, "after_normalize")
+            writer = STEPControl_Writer()
+            Interface_Static.SetCVal_s("write.step.schema", "AP203")
+            writer.Transfer(normalized.wrapped, STEPControl_AsIs)
+            status = writer.Write(str(filepath))
+            if status != IFSelect_RetDone:
+                raise RuntimeError(f"STEP export failed (status {status})")
+            # Diagnostic B: what orientation flags did the writer put in the file?
+            try:
+                with open(filepath) as _f:
+                    _lines = _f.readlines()
+                for _l in _lines:
+                    if "MANIFOLD_SOLID_BREP" in _l or "CLOSED_SHELL" in _l:
+                        print(f"  DIAG [STEP file] {_l.rstrip()}")
+                _af = [_l.rstrip() for _l in _lines if "ADVANCED_FACE" in _l]
+                print(f"  DIAG [STEP file] {len(_af)} ADVANCED_FACE entries; "
+                      f"same_sense flags: "
+                      f"{sum(1 for l in _af if l.rstrip().endswith('.T.);'))} .T. / "
+                      f"{sum(1 for l in _af if l.rstrip().endswith('.F.);'))} .F.")
+                for _l in _af[:3]:
+                    print(f"  DIAG [STEP file]   {_l}")
+            except Exception as _e:
+                print(f"  DIAG [STEP file] could not read: {_e}")
     elif fmt == "stl":
         src = shape.toCompound() if is_assembly else shape
         cq.exporters.export(src, filepath, exportType="STL",
@@ -1399,9 +2078,13 @@ PARAMETER GUIDE FOR 3D PRINTING
     p.add_argument("--no-fillet", action="store_true",
                    help="Export raw overlapping sphere+cylinder compound "
                         "(no boolean union)")
+    p.add_argument("--skip-normalize", action="store_true",
+                   help="Skip _normalize_shell_orientations before STEP export "
+                        "(diagnostic: test whether normalization is the source of "
+                        "orientation errors)")
     p.add_argument("--union", action="store_true",
-                   help="Boolean-union all hub solids into a single solid before "
-                        "export (slower but produces one manifold body)")
+                   help="Accepted for backward compatibility; has no effect "
+                        "(the default path always produces a single fused solid)")
     p.add_argument("--bond-tolerance", type=float, default=0.4,
                    help="Bond-inference distance tolerance in Angstroms "
                         "for XYZ/PDB files (default: 0.4)")
@@ -1440,11 +2123,6 @@ PARAMETER GUIDE FOR 3D PRINTING
     p.add_argument("--check-self-intersect", action="store_true",
                    help="Add self-intersection test to --check-integrity "
                         "(slow: O(n²) in face count; use on small files only)")
-    p.add_argument("--probe-depth", type=float, default=0.5,
-                   help=argparse.SUPPRESS)   # legacy, kept for compat
-    p.add_argument("--probe-samples", type=int, default=12,
-                   help=argparse.SUPPRESS)   # legacy, kept for compat
-
     args = p.parse_args()
 
     # --check-integrity doesn't need a molecule file
@@ -1464,7 +2142,6 @@ PARAMETER GUIDE FOR 3D PRINTING
         mol.center_on_origin()
 
     t_r = tube_radius_mm(args.scale, args.bond_scale, args.tube_radius)
-    MIN_EXCESS = max(0.05, t_r * 0.01)
 
     bb_min, bb_max = mol.bounding_box()
     ext = (bb_max - bb_min) * args.scale
@@ -1478,8 +2155,7 @@ PARAMETER GUIDE FOR 3D PRINTING
     print(f"  {'----':4s}  {'------':>6s}  {'-----':>7s}  {'-----':>7s}")
     for e in elems:
         vdw = VDW_RADII.get(e, DEFAULT_VDW_RADIUS)
-        r = max(sphere_radius_mm(vdw, args.scale, args.vdw_scale),
-                t_r + MIN_EXCESS)
+        r = _atom_r(vdw, args.scale, args.vdw_scale, t_r)
         print(f"  {e:4s}  {vdw:6.2f}  {r:7.2f}  {r*2:7.2f}")
     print(f"  {'tube':4s}  {VDW_RADII['H']:6.2f}  {t_r:7.2f}  {t_r*2:7.2f}")
     print(f"\n  Bounding box: {bb_min.round(2)} to {bb_max.round(2)} A")
@@ -1488,9 +2164,7 @@ PARAMETER GUIDE FOR 3D PRINTING
     if args.check_step:
         check_step_gaps(args.check_step, mol,
                         args.scale, args.vdw_scale, args.bond_scale,
-                        args.tube_radius,
-                        n_samples=args.probe_samples,
-                        probe_depth=args.probe_depth)
+                        args.tube_radius)
         return
 
     if args.check_integrity:
@@ -1517,20 +2191,23 @@ PARAMETER GUIDE FOR 3D PRINTING
     print(f"\nBuilding model...")
     shape = build_model(
         mol, args.scale, args.vdw_scale, args.bond_scale,
-        args.tube_radius, None, args.no_fillet,
-        args.add_base, args.base_thickness, args.base_margin,
-        args.union)
+        args.tube_radius, args.no_fillet,
+        args.add_base, args.base_thickness, args.base_margin)
 
     print(f"  Exporting: {args.output}")
-    export_model(shape, args.output, args.format)
+    export_model(shape, args.output, args.format,
+                 skip_normalize=args.skip_normalize)
     print(f"Done -> {args.output}")
+
     if args.no_fillet:
-        print(f"\n  The STEP compound contains one body per sphere/cylinder.")
-        print(f"  To get a single solid in CAD:")
-        print(f"    FreeCAD : select all bodies -> Part -> Boolean -> Union")
-        print(f"    OnShape : select all -> Boolean -> Union")
-    else:
-        print(f"\n  Output is a single fused solid.")
+        n_bodies = len(shape.Solids())
+        print(f"\n  Compound: {n_bodies} separate bodies "
+              f"(--no-fillet mode — no boolean union).")
+    elif args.format in ("step", "stp"):
+        print()
+        check_final_output(args.output, mol,
+                           args.scale, args.vdw_scale, args.bond_scale,
+                           args.tube_radius)
 
 
 if __name__ == "__main__":

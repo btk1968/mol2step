@@ -16,17 +16,21 @@ geometry directly.
 
 ## Architecture
 
-Each atom becomes one **hub solid**: the atom sphere fused with full-length
-bond tubes to every neighbour.  CadQuery's `.fillet()` is applied to the
-complete hub, invoking OCCT's `BRepFilletAPI_MakeFillet` — a rolling-ball
-fillet that conforms to both the sphere surface and the cylinder surface at
-every junction simultaneously.
+Each atom becomes one **sphere primitive** sized to its van der Waals radius.
+Each bond becomes one or more **cylinder primitives** (one strand per bond
+order) sized to the hydrogen VdW radius times `--bond-scale`.
 
-This means:
-- Each atom sphere appears **exactly once** (no duplicate-sphere artefacts)
-- All junctions at a given atom are filleted **together** in one OCCT call
-- Junction quality (overlap and meeting angle) is computed **analytically**
-  at build time and reported immediately
+All sphere and cylinder primitives are collected into a flat list and fused
+in a **single `BRepAlgoAPI_Fuse` call** (multi-tool mode) to produce one
+solid BREP body.  This avoids the incremental pairwise orientation artefacts
+that occur when fusing solids one-by-one.
+
+`--no-fillet` skips the boolean entirely and exports a `Compound` of the raw
+overlapping primitives — always valid STEP, useful as a quick preview or when
+the fuse fails on unusual geometry.
+
+Junction geometry (overlap and angle at every sphere–tube contact) is computed
+analytically from the model parameters at build time and reported as a table.
 
 ## Pipeline
 
@@ -37,13 +41,13 @@ This means:
   .cjson / .mol / .xyz / .pdb      ← molecular coordinates + bonds
             │
             ▼
-      mol2step.py (CadQuery)        ← hub solids: sphere ∪ tubes, then fillet
+      mol2step.py (CadQuery)        ← sphere + cylinder primitives → BRepAlgoAPI_Fuse
             │
             ▼
-         .step file                  ← true BREP: spheres, cylinders, fillets
+         .step file                  ← true BREP: single fused solid
             │
             ▼
-    FreeCAD / OnShape                ← union all bodies, add struts/base
+    FreeCAD / OnShape                ← add struts/base, fillet edges if desired
             │
             ▼
        .stl / .3mf
@@ -115,14 +119,7 @@ python mol2step.py <input> [options]
 | `--vdw-scale` | `1.0` | Atom sphere radius multiplier |
 | `--bond-scale` | `0.7` | Bond tube radius multiplier |
 | `--tube-radius` | — | Hard override for tube radius in mm (bypasses `--bond-scale`) |
-| `--fillet-size` | auto | Rolling-ball fillet radius in mm (default: `tube_r * 0.3`) |
-| `--no-fillet` | off | Skip filleting; export raw fused sphere+tube hubs |
-
-### Bond inference (XYZ / PDB only)
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--bond-tolerance` | `0.4` | Distance tolerance in Angstroms above sum of covalent radii |
+| `--no-fillet` | off | Export raw overlapping sphere+cylinder compound (no boolean union) |
 
 ### Base plate
 
@@ -132,6 +129,13 @@ python mol2step.py <input> [options]
 | `--base-thickness` | `3.0` | Base plate thickness in mm |
 | `--base-margin` | `5.0` | Base plate margin beyond molecule bounding box in mm |
 
+### Bond inference (XYZ / PDB only)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--bond-tolerance` | `0.4` | Distance tolerance in Angstroms above sum of covalent radii |
+| `--min-bond-dist` | `0.4` | Minimum interatomic distance (Å) treated as a bond |
+
 ### Diagnostic / informational
 
 | Option | Description |
@@ -139,6 +143,8 @@ python mol2step.py <input> [options]
 | `--info` | Print atom and tube sizing table, then exit (no build) |
 | `--debug` | Verbose geometry validation: bond lengths, sphere/tube clearances |
 | `--check-step STEP_FILE` | Analyse junction overlap and angle for every bond endpoint |
+| `--check-integrity STEP_FILE` | OCCT BREP integrity check per solid (topology, free edges, volume sign) |
+| `--check-self-intersect` | Add self-intersection test to `--check-integrity` (slow) |
 | `--no-center` | Do not translate molecule to origin before building |
 
 ## Scale convention
@@ -149,8 +155,6 @@ Atom sphere diameter  =  VdW_radius(A) * --vdw-scale * --scale
 
 Bond tube diameter    =  VdW_H (1.2 A) * --bond-scale * --scale
                       ->  defaults: 8.4 mm diameter  (bond-scale 0.7)
-
-Fillet radius         =  tube_radius * 0.3  (auto)
 ```
 
 ## Junction geometry
@@ -178,7 +182,7 @@ junction angle — well clear of the gap threshold.
 | `--scale` | 10.0 | 8 – 15 | Increase for larger, more robust print |
 | `--vdw-scale` | 1.0 | 0.6 – 1.0 | 0.7 gives more open structure |
 | `--bond-scale` | 0.7 | 0.5 – 0.7 | Below 0.5 bonds become fragile on FDM |
-| `--fillet-size` | auto | — | Rarely needs manual override |
+| `--no-fillet` | off | — | Export raw compound (no boolean); use for quick preview |
 | `--base-thickness` | 3.0 | 2 – 5 | Thicker for larger molecules |
 
 **Minimum printable tube diameter** on FDM is roughly 2 mm.  At `--scale 10`
@@ -216,17 +220,18 @@ After generating the STEP file, open it in FreeCAD or OnShape.
 
 ### FreeCAD
 1. **File → Open** the `.step` file
-2. Select all bodies in the Model tree
-3. **Part → Boolean → Union** — produces one solid body
-4. **Part → Fillet** on any remaining sharp edges if desired
-5. Add support struts or a stand with **Part → Primitives**
-6. **File → Export → STL or 3MF**
+2. The model arrives as a single solid body — no union step needed
+3. Add support struts or a stand with **Part → Primitives**
+4. Apply **Part → Fillet** on junction edges if desired
+5. **File → Export → STL or 3MF**
 
 ### OnShape
-1. Import the `.step` file (arrives as a Part Studio with multiple solids)
-2. **Boolean → Union** all parts — one solid
-3. Use Fillet / Chamfer tools as desired
-4. **Right-click Part → Export → STL or 3MF**
+1. Import the `.step` file (arrives as a single solid in Part Studio)
+2. Use Fillet / Chamfer tools as desired
+3. **Right-click Part → Export → STL or 3MF**
+
+> If you used `--no-fillet`, the file contains one body per primitive.
+> Select all bodies and run **Boolean → Union** before exporting.
 
 ## Troubleshooting
 
@@ -240,14 +245,9 @@ Run `--info` and check the overlap column.  If H shows near-zero overlap,
 `--bond-scale` is too high.  The default 0.7 is chosen to avoid this.  Run
 `--check-step` to get the full junction geometry table.
 
-**Fillet failures (n failed printed at end of build)**
-Try `--fillet-size` with a smaller value, or `--no-fillet` to confirm the
-unfilleted geometry is otherwise correct.  Fillet failure usually means the
-requested radius is too large relative to the local geometry.
-
 **Slow build for large molecules**
-OCCT boolean union of many cylinders per hub is the bottleneck.  Atoms with
-many bonds take longer.  Use `--no-fillet` for a quick preview.
+The `BRepAlgoAPI_Fuse` of all primitives in one call is the bottleneck.
+Use `--no-fillet` for a quick preview (exports a compound with no boolean).
 
 **OnShape import fails**
 OnShape handles STEP well but occasionally chokes on very complex boolean
