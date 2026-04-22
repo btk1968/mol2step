@@ -5,3 +5,7 @@ __pycache__/
 env/
 *.step
 *.stp
+*.stl
+*.3mf
+*.zip
+.claude/
