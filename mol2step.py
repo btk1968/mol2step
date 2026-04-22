@@ -27,6 +27,7 @@ License: AGPL-3.0-or-later
 """
 
 import argparse
+import json
 import math
 import sys
 from dataclasses import dataclass, field
@@ -103,6 +104,7 @@ COVALENT_RADII = {
     "Pu": 1.87, "Am": 1.80, "Cm": 1.69,
 }
 DEFAULT_COVALENT_RADIUS = 1.50
+MIN_BOND_DIST = 0.4  # Å — minimum interatomic distance treated as a bond
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -153,28 +155,92 @@ class Molecule:
         coords = np.array([[a.x, a.y, a.z] for a in self.atoms])
         return coords.min(axis=0), coords.max(axis=0)
 
+    def adjacency(self):
+        """Return {atom_idx: [(bond, neighbor_atom)]} for every atom."""
+        adj = {a.index: [] for a in self.atoms}
+        for bond in self.bonds:
+            a1 = self.atoms[bond.atom1_idx]
+            a2 = self.atoms[bond.atom2_idx]
+            adj[bond.atom1_idx].append((bond, a2))
+            adj[bond.atom2_idx].append((bond, a1))
+        return adj
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GEOMETRY HELPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _bond_offsets(d_hat, order, t_r):
+    """
+    Return [(offset_vector, cylinder_radius)] for each strand of a bond.
+
+    Single bond: one entry — zero offset, radius t_r.
+    Multi bond:  `order` entries evenly distributed angularly around d_hat,
+                 using reduced radius (t_r * 0.65) and lateral offset (t_r * 0.85).
+
+    d_hat must be a unit numpy array along the bond axis.
+    """
+    if order == 1:
+        return [(np.zeros(3), t_r)]
+    mr = t_r * 0.65
+    od = t_r * 0.85
+    ref = np.array([0.0, 0.0, 1.0]) if abs(d_hat[2]) < 0.707 \
+          else np.array([1.0, 0.0, 0.0])
+    u = np.cross(d_hat, ref)
+    u /= np.linalg.norm(u)
+    v = np.cross(d_hat, u)
+    result = []
+    for k in range(order):
+        theta = math.pi * k if order == 2 else 2.0 * math.pi * k / order
+        off = od * (math.cos(theta) * u + math.sin(theta) * v)
+        result.append((off, mr))
+    return result
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FILE PARSERS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def parse_mol_file(filepath):
+    filepath = Path(filepath)
     mol = Molecule()
     with open(filepath) as f:
         lines = f.readlines()
-    mol.name = lines[0].strip() or Path(filepath).stem
-    counts = lines[3].split()
-    na, nb = int(counts[0]), int(counts[1])
+    if len(lines) < 4:
+        raise ValueError(f"{filepath}: too short to be a valid V2000 MOL file")
+    mol.name = lines[0].strip() or filepath.stem
+    # V2000 counts line uses fixed-width fields: cols 0-2 = atom count, 3-5 = bond count
+    counts_line = lines[3]
+    try:
+        na, nb = int(counts_line[0:3]), int(counts_line[3:6])
+    except ValueError:
+        raise ValueError(f"{filepath}: malformed counts line: {counts_line!r}")
+    if len(lines) < 4 + na + nb:
+        raise ValueError(
+            f"{filepath}: file truncated (expected {4 + na + nb} lines, got {len(lines)})")
+    # V2000 atom block: cols 0-9 = x, 10-19 = y, 20-29 = z, 31-33 = element symbol
     for i in range(na):
-        p = lines[4 + i].split()
-        mol.atoms.append(Atom(i, p[3].strip(), float(p[0]), float(p[1]), float(p[2])))
+        ln = lines[4 + i]
+        try:
+            x, y, z = float(ln[0:10]), float(ln[10:20]), float(ln[20:30])
+            elem = ln[31:34].strip()
+        except (ValueError, IndexError):
+            raise ValueError(f"{filepath}: malformed atom line {4 + i + 1}: {ln!r}")
+        if not elem:
+            raise ValueError(f"{filepath}: empty element symbol on atom line {4 + i + 1}")
+        mol.atoms.append(Atom(i, elem, x, y, z))
+    # V2000 bond block: cols 0-2 = atom1, 3-5 = atom2, 6-8 = bond order
     for i in range(nb):
-        p = lines[4 + na + i].split()
-        mol.bonds.append(Bond(int(p[0]) - 1, int(p[1]) - 1, int(p[2])))
+        ln = lines[4 + na + i]
+        try:
+            a1, a2, order = int(ln[0:3]), int(ln[3:6]), int(ln[6:9])
+        except (ValueError, IndexError):
+            raise ValueError(f"{filepath}: malformed bond line {4 + na + i + 1}: {ln!r}")
+        mol.bonds.append(Bond(a1 - 1, a2 - 1, order))
     return mol
 
 
-def parse_xyz_file(filepath, tol=0.4):
+def parse_xyz_file(filepath, tol=0.4, min_bond_dist=MIN_BOND_DIST):
     mol = Molecule()
     with open(filepath) as f:
         lines = f.readlines()
@@ -188,12 +254,27 @@ def parse_xyz_file(filepath, tol=0.4):
         for j in range(i + 1, na):
             ai, aj = mol.atoms[i], mol.atoms[j]
             d = np.linalg.norm(ai.pos - aj.pos)
-            if 0.4 < d < ai.covalent_radius + aj.covalent_radius + tol:
+            if min_bond_dist < d < ai.covalent_radius + aj.covalent_radius + tol:
                 mol.bonds.append(Bond(i, j))
     return mol
 
 
-def parse_pdb_file(filepath, tol=0.4):
+def _pdb_element_from_name(name_field):
+    """Derive element symbol from PDB atom-name field (cols 12-16) as a fallback."""
+    nm = name_field.strip()
+    # Strip leading digits: "1HB", "2HD" etc. are hydrogen atoms
+    nm = nm.lstrip("0123456789")
+    alpha = "".join(c for c in nm if c.isalpha())[:2]
+    if not alpha:
+        return "X"
+    if len(alpha) == 1:
+        return alpha.upper()
+    candidate = alpha[0].upper() + alpha[1].lower()
+    # Accept two-letter symbol only if it's a known element; else fall back to one letter
+    return candidate if candidate in VDW_RADII else alpha[0].upper()
+
+
+def parse_pdb_file(filepath, tol=0.4, min_bond_dist=MIN_BOND_DIST):
     mol = Molecule()
     mol.name = Path(filepath).stem
     serial_map = {}
@@ -204,9 +285,7 @@ def parse_pdb_file(filepath, tol=0.4):
         if line[:6].strip() in ("ATOM", "HETATM"):
             elem = line[76:78].strip()
             if not elem:
-                nm = line[12:16].strip()
-                elem = "".join(c for c in nm if c.isalpha())[:2]
-                elem = elem[0].upper() + elem[1:].lower() if len(elem) > 1 else elem.upper()
+                elem = _pdb_element_from_name(line[12:16])
             mol.atoms.append(Atom(idx, elem, float(line[30:38]),
                                   float(line[38:46]), float(line[46:54])))
             serial_map[int(line[6:11])] = idx
@@ -217,12 +296,15 @@ def parse_pdb_file(filepath, tol=0.4):
         if line.startswith("CONECT"):
             conect = True
             parts = line[6:].split()
-            if not parts: continue
+            if not parts:
+                continue
             i1 = serial_map.get(int(parts[0]))
-            if i1 is None: continue
+            if i1 is None:
+                continue
             for s in parts[1:]:
                 i2 = serial_map.get(int(s))
-                if i2 is None: continue
+                if i2 is None:
+                    continue
                 k = (min(i1, i2), max(i1, i2))
                 if k not in seen:
                     seen.add(k)
@@ -233,19 +315,23 @@ def parse_pdb_file(filepath, tol=0.4):
             for j in range(i + 1, n):
                 ai, aj = mol.atoms[i], mol.atoms[j]
                 d = np.linalg.norm(ai.pos - aj.pos)
-                if 0.4 < d < ai.covalent_radius + aj.covalent_radius + tol:
+                if min_bond_dist < d < ai.covalent_radius + aj.covalent_radius + tol:
                     mol.bonds.append(Bond(i, j))
     return mol
 
 
-def load_molecule(filepath, tol=0.4):
+def load_molecule(filepath, tol=0.4, min_bond_dist=MIN_BOND_DIST):
     ext = Path(filepath).suffix.lower()
-    if ext in (".mol", ".sdf"):   return parse_mol_file(filepath)
-    elif ext == ".xyz":           return parse_xyz_file(filepath, tol)
-    elif ext == ".pdb":           return parse_pdb_file(filepath, tol)
-    elif ext in (".cjson", ".json"):  return parse_cjson_file(filepath, tol)
-    else: raise ValueError(
-        f"Unsupported: {ext}. Use .mol .sdf .xyz .pdb .cjson .json")
+    if ext in (".mol", ".sdf"):
+        return parse_mol_file(filepath)
+    elif ext == ".xyz":
+        return parse_xyz_file(filepath, tol, min_bond_dist)
+    elif ext == ".pdb":
+        return parse_pdb_file(filepath, tol, min_bond_dist)
+    elif ext in (".cjson", ".json"):
+        return parse_cjson_file(filepath, tol, min_bond_dist)
+    else:
+        raise ValueError(f"Unsupported: {ext}. Use .mol .sdf .xyz .pdb .cjson .json")
 
 
 def validate_molecule(mol):
@@ -308,7 +394,7 @@ _Z_TO_SYMBOL = {
 }
 
 
-def parse_cjson_file(filepath, tol=0.4):
+def parse_cjson_file(filepath, tol=0.4, min_bond_dist=MIN_BOND_DIST):
     """
     Parse an Avogadro2 Chemical JSON (CJSON) file.
 
@@ -336,8 +422,6 @@ def parse_cjson_file(filepath, tol=0.4):
     If bonds are absent, they are inferred from covalent radii.
     Handles both CJSON v0 (spaces in keys) and v1 (camelCase).
     """
-    import json
-
     mol = Molecule()
     with open(filepath) as f:
         data = json.load(f)
@@ -433,7 +517,7 @@ def parse_cjson_file(filepath, tol=0.4):
             for j in range(i + 1, num_atoms):
                 ai, aj = mol.atoms[i], mol.atoms[j]
                 d = np.linalg.norm(ai.pos - aj.pos)
-                if 0.4 < d < ai.covalent_radius + aj.covalent_radius + tol:
+                if min_bond_dist < d < ai.covalent_radius + aj.covalent_radius + tol:
                     mol.bonds.append(Bond(i, j))
 
     return mol
@@ -443,45 +527,63 @@ def parse_cjson_file(filepath, tol=0.4):
 # CAD PRIMITIVES — no rotation math, uses Plane-based extrusion
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _make_sphere(cq, center_mm, radius_mm):
+def _make_sphere(center_mm, radius_mm):
     """Create a solid sphere at center_mm with given radius."""
+    import cadquery as cq
     s = cq.Workplane("XY").sphere(radius_mm)
     return s.translate(cq.Vector(center_mm[0], center_mm[1], center_mm[2]))
 
 
-def _make_cylinder(cq, start_mm, end_mm, radius_mm):
-    """
-    Create a solid cylinder from start_mm to end_mm.
+def _as_solid(shape):
+    """Ensure shape is a cq.Solid, unwrapping or rebuilding as needed.
 
-    Uses CadQuery Plane-based extrusion: creates a workplane at start_mm
-    with its normal pointing toward end_mm, draws a circle, and extrudes
-    for the exact distance. NO rotation math involved.
+    BRepAlgoAPI_Fuse always returns TopoDS_Compound.  OCCT occasionally
+    wraps the result as a closed Shell rather than a Solid.
+    We handle both cases:
+      1. Compound contains one Solid  → unwrap directly.
+      2. Compound contains zero Solids but one closed Shell
+         → rebuild a Solid via BRepBuilderAPI_MakeSolid.
     """
+    solids = shape.Solids()
+    if len(solids) == 1:
+        return solids[0]
+    if len(solids) == 0:
+        shells = shape.Shells()
+        if len(shells) == 1:
+            from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
+            import cadquery as cq
+            ms = BRepBuilderAPI_MakeSolid(shells[0].wrapped)
+            if ms.IsDone():
+                return cq.Shape.cast(ms.Solid())
+    return shape
+
+
+def _make_cylinder(start_mm, end_mm, radius_mm):
+    """
+    Create a solid cylinder from start_mm to end_mm using Plane-based extrusion.
+    Returns None for zero-length segments.
+    """
+    import cadquery as cq
     start = np.asarray(start_mm, dtype=float)
-    end = np.asarray(end_mm, dtype=float)
+    end   = np.asarray(end_mm,   dtype=float)
     direction = end - start
     length = np.linalg.norm(direction)
     if length < 1e-6:
         return None
 
-    normal = cq.Vector(direction[0], direction[1], direction[2]).normalized()
+    nv     = direction / length
+    normal = cq.Vector(nv[0], nv[1], nv[2])
     origin = cq.Vector(start[0], start[1], start[2])
 
-    # xDir must be perpendicular to normal. Pick a stable reference.
-    nv = direction / length
-    if abs(nv[2]) < 0.9:
-        ref = np.array([0, 0, 1])
-    elif abs(nv[0]) < 0.9:
-        ref = np.array([1, 0, 0])
-    else:
-        ref = np.array([0, 1, 0])
+    # xDir must be perpendicular to normal. Use Z unless bond is near-vertical,
+    # then use X.  Threshold 1/√2 guarantees cross product is non-degenerate.
+    ref      = np.array([0.0, 0.0, 1.0]) if abs(nv[2]) < 0.707 else np.array([1.0, 0.0, 0.0])
     x_dir_np = np.cross(nv, ref)
-    x_dir_np = x_dir_np / np.linalg.norm(x_dir_np)
-    x_dir = cq.Vector(x_dir_np[0], x_dir_np[1], x_dir_np[2])
+    x_dir_np /= np.linalg.norm(x_dir_np)
+    x_dir    = cq.Vector(x_dir_np[0], x_dir_np[1], x_dir_np[2])
 
     plane = cq.Plane(origin=origin, normal=normal, xDir=x_dir)
-    cyl = cq.Workplane(plane).circle(radius_mm).extrude(length)
-    return cyl
+    return cq.Workplane(plane).circle(radius_mm).extrude(length)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -534,25 +636,10 @@ def validate_geometry(mol, scale, vdw_scale, bond_scale,
         cyl_end = p2
         cyl_length = length
 
-        if bond.order == 1:
-            offsets = [(np.zeros(3), t_r, "single")]
-        else:
-            mr = t_r * 0.65
-            od = t_r * 0.85
-            if abs(d_hat[0]) < 0.9:
-                perp = np.cross(d_hat, [1, 0, 0])
-            else:
-                perp = np.cross(d_hat, [0, 1, 0])
-            perp = perp / np.linalg.norm(perp)
-            offsets = []
-            for k in range(bond.order):
-                theta = math.pi * k if bond.order == 2 else \
-                    2 * math.pi * k / bond.order
-                off = perp * od * math.cos(theta)
-                if bond.order > 1:
-                    perp2 = np.cross(d_hat, perp)
-                    off = off + perp2 * od * math.sin(theta)
-                offsets.append((off, mr, f"multi-k{k}"))
+        raw = _bond_offsets(d_hat, bond.order, t_r)
+        kind_label = "single" if bond.order == 1 else None
+        offsets = [(off, cr, kind_label or f"multi-k{k}")
+                   for k, (off, cr) in enumerate(raw)]
 
         for off, cr, kind in offsets:
             for label, center, sph_r in [
@@ -613,42 +700,33 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
                 no_fillet=False, add_base=False, base_thickness=3.0,
                 base_margin=5.0, union_all=False):
     """
-    Per-atom hub architecture with OCCT rolling-ball fillets.
+    Build ball-and-stick molecular model as a single fused BREP solid.
 
-    Compound (union_all=False):
-        Both hubs receive the full tube; per-hub fillet covers both
-        sphere-tube junctions before assembly into a compound.
+    All sphere and cylinder primitives are collected into a flat list and
+    fused in one BRepAlgoAPI_Fuse call (multi-tool mode).
 
-    Union (union_all=True):
-        Lower-indexed hub owns the full tube (no coincident cylinders).
-        Per-hub fillet is skipped.  After fusing all hubs, a per-atom
-        fillet pass selects every junction edge near each atom's sphere
-        (filtered by radius ≈ tube radius) and fillets them all in one
-        OCCT call, letting it compute compatible blends for every bond
-        meeting at that atom simultaneously.
-
-    CadQuery .fillet() is then applied to the complete hub.  OCCT's
-    BRepFilletAPI_MakeFillet finds every sphere-cylinder intersection
-    edge on the hub and computes a rolling-ball fillet conforming to
-    both surfaces simultaneously.  No torus approximations.
-
-    Returns a CadQuery Compound of hub solids (or a single fused Solid
-    when union_all=True).
+    --no-fillet : outputs overlapping sphere+cylinder primitives as a
+                  Compound (no boolean, always valid STEP).
+    --union     : accepted for backward compatibility; the default path
+                  always produces a single fused solid.
     """
+    if not mol.atoms:
+        raise ValueError("Molecule has no atoms — nothing to build.")
+
     import cadquery as cq
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+    from OCP.TopTools import TopTools_ListOfShape
 
     t_r = tube_radius_mm(scale, bond_scale, tube_radius_override)
-    if fillet_size is None:
-        fillet_size = t_r * 0.3
     MIN_EXCESS = max(0.05, t_r * 0.01)
 
     def atom_r(atom):
         return max(sphere_radius_mm(atom.vdw_radius, scale, vdw_scale),
                    t_r + MIN_EXCESS)
 
-    # ── Sizing and junction-geometry table ─────────────────────────────
+    # ── Sizing table ──────────────────────────────────────────────────────
     print(f"  Scale: {scale} mm/A  VdW: {vdw_scale}x  Bond: {bond_scale}x")
-    print(f"  Tube radius: {t_r:.3f} mm   fillet: {fillet_size:.3f} mm")
+    print(f"  Tube radius: {t_r:.3f} mm")
     print()
     print(f"  {'Elem':4s}  {'sph_r':>7s}  {'overlap':>8s}  {'angle':>7s}  status")
     print(f"  {'----':4s}  {'-----':>7s}  {'-------':>8s}  {'-----':>7s}  ------")
@@ -662,7 +740,6 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
         print(f"  {elem:4s}  {r:7.3f}  {ov:8.3f}  {ang:7.1f}  {st}")
     print()
 
-    # ── Analytical gap check across all bonds ──────────────────────────
     gap_count = 0
     for bond in mol.bonds:
         for atom in (mol.atoms[bond.atom1_idx], mol.atoms[bond.atom2_idx]):
@@ -675,126 +752,86 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
         print("  All junction overlaps >= 0.3 mm  (ok)")
     print()
 
-    # ── Compute per-bond tube geometry (once per bond) ─────────────────
-    # Compound (union_all=False):
-    #   Both hubs get the full tube → per-hub fillet covers both junctions.
-    #   Overlapping tubes in a compound are harmless (no boolean performed).
-    #
-    # Union (union_all=True):
-    #   Only the lower-indexed hub gets the tube → no coincident cylinders
-    #   → fuse() does not deadlock or produce empty geometry.
-    #   The lo-end fillet is done per-hub.  The hi-end junction is a sharp
-    #   circular edge on the fused solid; it is filleted selectively
-    #   afterwards by matching its radius to the tube radius.
-    #
-    # atom_tubes[atom.index] = list of (start_mm, end_mm, cyl_radius)
+    # ── Path 1: --no-fillet compound (validated, no boolean) ─────────────
+    if no_fillet:
+        shapes = []
+        for atom in mol.atoms:
+            pos = np.asarray(atom.pos * scale, dtype=float)
+            shapes.append(_make_sphere(pos, atom_r(atom)).val())
+        n_cyl = 0
+        for bond in mol.bonds:
+            a1 = mol.atoms[bond.atom1_idx]
+            a2 = mol.atoms[bond.atom2_idx]
+            p1 = np.asarray(a1.pos * scale, dtype=float)
+            p2 = np.asarray(a2.pos * scale, dtype=float)
+            L  = float(np.linalg.norm(p2 - p1))
+            if L < 0.01:
+                continue
+            d = (p2 - p1) / L
+            for off, cyl_r in _bond_offsets(d, bond.order, t_r):
+                cyl = _make_cylinder(p1 + off, p2 + off, cyl_r)
+                if cyl is not None:
+                    shapes.append(cyl.val())
+                    n_cyl += 1
+        print(f"  Bodies: {len(mol.atoms)} spheres + {n_cyl} cylinders "
+              f"(no boolean — overlapping primitives)")
+        return cq.Compound.makeCompound(shapes)
 
-    atom_tubes = {a.index: [] for a in mol.atoms}
+    # ── Path 2: multi-tool fuse ───────────────────────────────────────────
 
-    for bond in mol.bonds:
-        a1  = mol.atoms[bond.atom1_idx]
-        a2  = mol.atoms[bond.atom2_idx]
-        p1  = np.asarray(a1.pos * scale, dtype=float)
-        p2  = np.asarray(a2.pos * scale, dtype=float)
-        vec = p2 - p1
-        L   = float(np.linalg.norm(vec))
-        if L < 0.01:
-            continue
-        d = vec / L
-
-        if union_all:
-            lo = min(bond.atom1_idx, bond.atom2_idx)
-            hi = max(bond.atom1_idx, bond.atom2_idx)
-            p_lo = np.asarray(mol.atoms[lo].pos * scale, dtype=float)
-            p_hi = np.asarray(mol.atoms[hi].pos * scale, dtype=float)
-            d_lo = (p_hi - p_lo) / L
-            if bond.order == 1:
-                atom_tubes[lo].append((p_lo, p_hi, t_r))
-            else:
-                mr  = t_r * 0.65
-                od  = t_r * 0.85
-                ref = np.array([1.0, 0.0, 0.0]) if abs(d_lo[0]) < 0.9 \
-                      else np.array([0.0, 1.0, 0.0])
-                u   = np.cross(d_lo, ref); u /= np.linalg.norm(u)
-                v   = np.cross(d_lo, u)
-                for k in range(bond.order):
-                    theta = (math.pi * k) if bond.order == 2 else \
-                            (2.0 * math.pi * k / bond.order)
-                    off = od * (math.cos(theta) * u + math.sin(theta) * v)
-                    atom_tubes[lo].append((p_lo + off, p_hi + off, mr))
-        else:
-            if bond.order == 1:
-                atom_tubes[a1.index].append((p1, p2, t_r))
-                atom_tubes[a2.index].append((p2, p1, t_r))
-            else:
-                mr  = t_r * 0.65
-                od  = t_r * 0.85
-                ref = np.array([1.0, 0.0, 0.0]) if abs(d[0]) < 0.9 \
-                      else np.array([0.0, 1.0, 0.0])
-                u   = np.cross(d, ref); u /= np.linalg.norm(u)
-                v   = np.cross(d, u)
-                for k in range(bond.order):
-                    theta = (math.pi * k) if bond.order == 2 else \
-                            (2.0 * math.pi * k / bond.order)
-                    off = od * (math.cos(theta) * u + math.sin(theta) * v)
-                    atom_tubes[a1.index].append((p1 + off, p2 + off, mr))
-                    atom_tubes[a2.index].append((p2 + off, p1 + off, mr))
-
-    # ── Build hubs ─────────────────────────────────────────────────────
-    print(f"  Building {len(mol.atoms)} hubs (sphere + tubes, then fillet)...")
-
-    hub_solids    = []
-    orphan_solids = []   # tubes that failed to fuse — kept separate, coloured red
-    fillet_ok   = 0
-    fillet_fail = 0
+    # Build all sphere and cylinder primitives as a flat list
+    all_shapes = []
 
     for atom in mol.atoms:
         pos = np.asarray(atom.pos * scale, dtype=float)
-        r   = atom_r(atom)
+        all_shapes.append(_make_sphere(pos, atom_r(atom)).val())
 
-        # Start with the atom sphere
-        hub = _make_sphere(cq, pos, r)
+    n_cyl = 0
+    for bond in mol.bonds:
+        a1 = mol.atoms[bond.atom1_idx]
+        a2 = mol.atoms[bond.atom2_idx]
+        p1 = np.asarray(a1.pos * scale, dtype=float)
+        p2 = np.asarray(a2.pos * scale, dtype=float)
+        L  = float(np.linalg.norm(p2 - p1))
+        if L < 0.01:
+            continue
+        d = (p2 - p1) / L
+        for off, cyl_r in _bond_offsets(d, bond.order, t_r):
+            cyl = _make_cylinder(p1 + off, p2 + off, cyl_r)
+            if cyl is not None:
+                all_shapes.append(cyl.val())
+                n_cyl += 1
 
-        # Fuse every bond tube into this hub
-        for (start, end, cyl_r) in atom_tubes[atom.index]:
-            cyl = _make_cylinder(cq, start, end, cyl_r)
-            if cyl is None:
-                continue
-            try:
-                hub = hub.union(cyl)
-            except Exception as exc:
-                print(f"    WARNING: {atom.element}{atom.index}: tube union failed"
-                      f" ({exc}) -- adding as orphan body (red in output)")
-                orphan_solids.append(cyl)
+    print(f"  Primitives: {len(mol.atoms)} spheres + {n_cyl} cylinders")
 
-        # Per-hub fillet for compound output only.  For union output,
-        # filleting is done per-atom on the unified solid after fusing.
-        if not union_all and not no_fillet and fillet_size > 0 \
-                and atom_tubes[atom.index]:
-            filleted = False
-            for sz in [fillet_size, fillet_size * 0.5, fillet_size * 0.25]:
-                try:
-                    candidate = hub.fillet(sz)
-                    if len(candidate.val().Faces()) > 0:
-                        hub      = candidate
-                        filleted = True
-                        fillet_ok += 1
-                        break
-                except Exception:
-                    pass
-            if not filleted:
-                fillet_fail += 1
+    # Single multi-tool fuse: first shape is the argument, rest are tools.
+    # One kernel call avoids the incremental pairwise STEP-export orientation bug.
+    if len(all_shapes) == 1:
+        result = all_shapes[0]
+    else:
+        print(f"  Fusing {len(all_shapes)} primitives...")
+        arg_list  = TopTools_ListOfShape()
+        tool_list = TopTools_ListOfShape()
+        arg_list.Append(all_shapes[0].wrapped)
+        for s in all_shapes[1:]:
+            tool_list.Append(s.wrapped)
 
-        hub_solids.append(hub)
+        fuser = BRepAlgoAPI_Fuse()
+        fuser.SetArguments(arg_list)
+        fuser.SetTools(tool_list)
+        fuser.SetFuzzyValue(1e-6)
+        fuser.Build()
 
-    if not no_fillet:
-        print(f"  Fillets: {fillet_ok} ok, {fillet_fail} failed")
-    if orphan_solids:
-        print(f"  WARNING: {len(orphan_solids)} orphaned tube(s) — "
-              f"shown in red in STEP output")
-    print(f"  Bodies: {len(hub_solids)} hubs + {len(orphan_solids)} orphans")
+        if not fuser.IsDone():
+            print("  WARNING: multi-tool fuse failed — falling back to "
+                  "--no-fillet compound")
+            return cq.Compound.makeCompound(all_shapes)
 
-    # ── Optional base plate ────────────────────────────────────────────
+        result = _as_solid(cq.Shape.cast(fuser.Shape()))
+        print(f"  Fuse complete: {len(result.Faces())} faces, "
+              f"{len(result.Edges())} edges")
+
+    # ── Optional base plate ────────────────────────────────────────────────
     if add_base:
         max_r = max(atom_r(a) for a in mol.atoms)
         bb_min, bb_max = mol.bounding_box()
@@ -805,175 +842,28 @@ def build_model(mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
         dd = float(bmax[1] - bmin[1]) + 2 * base_margin + 2 * max_r
         cx = float(bmin[0] + bmax[0]) / 2.0
         cy = float(bmin[1] + bmax[1]) / 2.0
-        base = (cq.Workplane("XY")
-                .box(w, dd, base_thickness)
-                .translate(cq.Vector(cx, cy, z_bot - base_thickness / 2.0)))
+        base_wp = (cq.Workplane("XY")
+                   .box(w, dd, base_thickness)
+                   .translate(cq.Vector(cx, cy, z_bot - base_thickness / 2.0)))
         try:
-            base = base.edges("|Z").fillet(base_thickness * 0.4)
+            base_wp = base_wp.edges("|Z").fillet(base_thickness * 0.4)
         except Exception:
             pass
-        hub_solids.append(base)
+        base_solid = base_wp.val()
+        base_args  = TopTools_ListOfShape()
+        base_args.Append(result.wrapped)
+        base_tools = TopTools_ListOfShape()
+        base_tools.Append(base_solid.wrapped)
+        bf = BRepAlgoAPI_Fuse()
+        bf.SetArguments(base_args)
+        bf.SetTools(base_tools)
+        bf.Build()
+        if bf.IsDone():
+            result = _as_solid(cq.Shape.cast(bf.Shape()))
+        else:
+            return cq.Compound.makeCompound([result, base_solid])
 
-    all_hub_shapes = [s.val() if hasattr(s, 'val') else s for s in hub_solids]
-    all_orphan_shapes = [s.val() if hasattr(s, 'val') else s for s in orphan_solids]
-
-    if union_all:
-        all_shapes = all_hub_shapes + all_orphan_shapes
-        if all_orphan_shapes:
-            print(f"  Note: orphaned tubes included in union "
-                  f"(colour not applicable to unified solid)")
-        print(f"  Unioning {len(all_shapes)} bodies into one solid...")
-        result = all_shapes[0].fuse(*all_shapes[1:])
-        result = cq.Shape.cast(result.wrapped)
-        print(f"  Union complete.")
-
-        if not no_fillet and fillet_size > 0:
-            try:
-                from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet as _MakeFillet
-                _have_ocp = True
-            except ImportError:
-                _have_ocp = False
-
-            mr        = t_r * 0.65       # multi-bond tube radius
-            tube_radii = [t_r, mr]       # for radius-based edge filter
-
-            # Per-atom bond direction and order lookup for edge classification.
-            # Lets us assign the right fillet radius to each junction:
-            #   single-bond edge → fillet_size
-            #   double/triple edge → fillet_size * (mr / t_r)
-            atom_bond_dirs = {a.index: [] for a in mol.atoms}
-            for bond in mol.bonds:
-                ab1 = mol.atoms[bond.atom1_idx]
-                ab2 = mol.atoms[bond.atom2_idx]
-                pb1 = np.asarray(ab1.pos * scale, dtype=float)
-                pb2 = np.asarray(ab2.pos * scale, dtype=float)
-                dab = pb2 - pb1
-                Lab = float(np.linalg.norm(dab))
-                if Lab > 0.01:
-                    atom_bond_dirs[ab1.index].append((dab / Lab, bond.order))
-                    atom_bond_dirs[ab2.index].append((-dab / Lab, bond.order))
-
-            # Precompute degree for processing order.
-            # Terminal atoms (degree 1, typically H) must be filleted BEFORE
-            # the heavier atoms they're bonded to.  A fillet on a multi-bond
-            # atom modifies the solid topology near the adjacent H sphere and
-            # can invalidate H's junction edge for subsequent OCCT calls.
-            atom_degree = {a.index: 0 for a in mol.atoms}
-            for bond in mol.bonds:
-                atom_degree[bond.atom1_idx] += 1
-                atom_degree[bond.atom2_idx] += 1
-            atom_order = sorted(mol.atoms,
-                                key=lambda a: atom_degree[a.index])
-
-            print(f"  Filleting {len(mol.atoms)} atoms (per-atom "
-                  f"sphere-tube junctions)...")
-            atom_ok   = 0
-            atom_skip = 0
-            atom_fail = 0
-
-            for atom in atom_order:
-                apos  = np.asarray(atom.pos * scale, dtype=float)
-                sph_r = atom_r(atom)
-                r2max = (sph_r * 1.2) ** 2
-
-                junction_edges = []
-                for edge in result.Edges():
-                    try:
-                        c  = edge.Center()
-                        dx = c.x - apos[0]
-                        dy = c.y - apos[1]
-                        dz = c.z - apos[2]
-                        if dx*dx + dy*dy + dz*dz > r2max:
-                            continue
-                        # Prefer radius-based filter; after boolean fuse OCCT
-                        # often represents circles as B-splines so radius()
-                        # raises — fall back to proximity-only in that case.
-                        try:
-                            er = edge.radius()
-                            if any(abs(er - tr) / tr < 0.05
-                                   for tr in tube_radii):
-                                junction_edges.append(edge)
-                        except Exception:
-                            junction_edges.append(edge)
-                    except Exception:
-                        pass
-
-                if not junction_edges:
-                    atom_skip += 1
-                    continue
-
-                # For each junction edge, determine which bond it belongs to
-                # by comparing its direction from the atom center to each
-                # bond axis, then assign the bond-order-appropriate fillet
-                # size so double-bond (thin) tubes get a smaller fillet than
-                # single-bond tubes at the same atom.
-                bond_dirs = atom_bond_dirs[atom.index]
-                edge_fsize = []
-                for edge in junction_edges:
-                    try:
-                        c  = edge.Center()
-                        ev = np.array([c.x - apos[0],
-                                       c.y - apos[1],
-                                       c.z - apos[2]], dtype=float)
-                        el = float(np.linalg.norm(ev))
-                        if el > 1e-6 and bond_dirs:
-                            ev /= el
-                            best_order = 1
-                            best_dot   = -2.0
-                            for bdir, border in bond_dirs:
-                                dot = abs(float(np.dot(ev, bdir)))
-                                if dot > best_dot:
-                                    best_dot   = dot
-                                    best_order = border
-                        else:
-                            best_order = 1
-                    except Exception:
-                        best_order = 1
-                    fs = fillet_size if best_order == 1 \
-                         else fillet_size * (mr / t_r)
-                    edge_fsize.append((edge, fs))
-
-                n_faces  = len(result.Faces())
-                filleted = False
-                for sf in [1.0, 0.5, 0.25, 0.1]:
-                    try:
-                        if _have_ocp:
-                            mk = _MakeFillet(result.wrapped)
-                            for edge, fs in edge_fsize:
-                                mk.Add(fs * sf, edge.wrapped)
-                            mk.Build()
-                            if not mk.IsDone():
-                                continue
-                            candidate = cq.Shape.cast(mk.Shape())
-                        else:
-                            candidate = result.fillet(
-                                fillet_size * sf, junction_edges)
-                        if len(candidate.Faces()) > n_faces:
-                            result   = candidate
-                            filleted = True
-                            atom_ok += 1
-                            break
-                    except Exception:
-                        pass
-                if not filleted:
-                    print(f"    WARNING: {atom.element}[{atom.index}] "
-                          f"fillet failed ({len(junction_edges)} edges)")
-                    atom_fail += 1
-
-            print(f"  Per-atom fillets: {atom_ok} ok, "
-                  f"{atom_skip} skipped (no junction edges), "
-                  f"{atom_fail} failed")
-        return result
-
-    if orphan_solids:
-        assy = cq.Assembly()
-        for hub in hub_solids:
-            assy.add(hub)
-        for cyl in orphan_solids:
-            assy.add(cyl, color=cq.Color(1, 0, 0, 1))
-        return assy
-
-    return cq.Compound.makeCompound(all_hub_shapes)
+    return result
 
 
 def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
@@ -1004,14 +894,12 @@ def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
     print(f"JUNCTION GEOMETRY CHECK  ({step_file})")
     print("=" * 70)
 
-    # Load STEP just to count bodies
+    # Load STEP and count bodies
+    compound = None
     try:
         compound = cq.importers.importStep(str(step_file))
-        n_bodies  = len(compound.solids().vals())
-        expected  = len(mol.atoms)
-        body_note = "ok" if n_bodies >= expected \
-                    else f"WARNING expected >= {expected}"
-        print(f"  STEP solid bodies: {n_bodies}  [{body_note}]")
+        n_bodies = len(compound.solids().vals())
+        print(f"  STEP solid bodies: {n_bodies}  (molecule atoms: {len(mol.atoms)})")
     except Exception as exc:
         print(f"  Could not load STEP file: {exc}")
 
@@ -1069,7 +957,307 @@ def check_step_gaps(step_file, mol, scale=10.0, vdw_scale=1.0, bond_scale=1.0,
                   f"  angle={ang:.1f} deg  [{st}]")
     else:
         print("  All junctions ok.")
+
+    # --- Spatial atom-presence check ---
+    print()
+    print("  ATOM PRESENCE CHECK")
+    if compound is None:
+        print("  (STEP file not loaded — skipped)")
+    else:
+        try:
+            from OCP.BRepGProp import BRepGProp
+            from OCP.GProp import GProp_GProps
+
+            centroids = []
+            for solid in compound.solids().vals():
+                props = GProp_GProps()
+                BRepGProp.VolumeProperties_s(solid.wrapped, props)
+                c = props.CentreOfMass()
+                centroids.append(np.array([c.X(), c.Y(), c.Z()]))
+
+            centres_arr = np.array(centroids) if centroids else np.zeros((0, 3))
+            THRESHOLD_MM = 0.5
+            missing = []
+            for atom in mol.atoms:
+                expected_pos = np.asarray(atom.pos * scale, dtype=float)
+                if len(centres_arr) == 0:
+                    dist = float("inf")
+                else:
+                    dist = float(np.min(
+                        np.linalg.norm(centres_arr - expected_pos, axis=1)))
+                if dist > THRESHOLD_MM:
+                    missing.append((atom.index, atom.element, dist,
+                                    expected_pos))
+
+            if missing:
+                print(f"  WARNING: {len(missing)} atom(s) have no solid within "
+                      f"{THRESHOLD_MM} mm of their expected position:")
+                print(f"  {'Atom':10s}  {'nearest_mm':>10s}  expected_pos (mm)")
+                for idx, elem, dist, epos in missing:
+                    print(f"  {elem+str(idx):10s}  {dist:10.2f}  "
+                          f"({epos[0]:.2f}, {epos[1]:.2f}, {epos[2]:.2f})")
+            else:
+                print(f"  All {len(mol.atoms)} atoms present.  (ok)")
+        except Exception as exc:
+            print(f"  Atom presence check failed: {exc}")
+
     print("=" * 70)
+
+
+def check_solid_integrity(step_file, check_intersections=False):
+    """
+    Check BREP integrity of every solid in a STEP file using OCCT validators.
+
+    Three checks are run per solid:
+      1. BRepCheck_Analyzer          — topology & geometry validity (37 error codes)
+      2. ShapeAnalysis_ShapeContents — free edges / faces (watertightness proxy)
+      3. BRepGProp.VolumeProperties  — volume sign (negative = inverted orientation)
+
+    Optional (slow, off by default):
+      4. BRepAlgoAPI_Check           — self-intersection detection
+
+    Issues are classified as:
+      FATAL — would typically cause slicing to fail or produce broken prints
+      WARN  — may cause problems depending on slicer tolerance
+
+    Returns True if no fatal issues were found.
+    """
+    import cadquery as cq
+    from OCP.BRepCheck import BRepCheck_Analyzer, BRepCheck_Status
+    from OCP.ShapeAnalysis import ShapeAnalysis_ShapeContents
+    from OCP.BRepGProp import BRepGProp
+    from OCP.GProp import GProp_GProps
+    from OCP.TopExp import TopExp_Explorer
+    from OCP.TopAbs import TopAbs_SHELL, TopAbs_FACE, TopAbs_EDGE, TopAbs_VERTEX
+
+    # ── Classification tables (string-keyed for robustness across OCP versions) ──
+    _FATAL_NAMES = {
+        "BRepCheck_NotClosed",
+        "BRepCheck_NotConnected",
+        "BRepCheck_FreeEdge",
+        "BRepCheck_SelfIntersectingWire",
+        "BRepCheck_IntersectingWires",
+        "BRepCheck_BadOrientation",
+        "BRepCheck_BadOrientationOfSubshape",
+        "BRepCheck_UnorientableShape",
+        "BRepCheck_EmptyShell",
+        "BRepCheck_EmptyWire",
+        "BRepCheck_InvalidImbricationOfShells",
+    }
+
+    _DESC = {
+        "BRepCheck_NotClosed":
+            "shell not closed (open / not watertight)",
+        "BRepCheck_NotConnected":
+            "disconnected shell",
+        "BRepCheck_FreeEdge":
+            "free edge — belongs to only one face (non-manifold)",
+        "BRepCheck_SelfIntersectingWire":
+            "self-intersecting wire",
+        "BRepCheck_IntersectingWires":
+            "intersecting wires",
+        "BRepCheck_BadOrientation":
+            "bad face orientation (inverted normal)",
+        "BRepCheck_BadOrientationOfSubshape":
+            "bad sub-shape orientation",
+        "BRepCheck_UnorientableShape":
+            "unorientable shape",
+        "BRepCheck_EmptyShell":
+            "empty shell (no faces)",
+        "BRepCheck_EmptyWire":
+            "empty wire (no edges)",
+        "BRepCheck_InvalidSameParameterFlag":
+            "invalid same-parameter flag",
+        "BRepCheck_InvalidSameRangeFlag":
+            "invalid same-range flag",
+        "BRepCheck_InvalidPointOnSurface":
+            "invalid point on surface",
+        "BRepCheck_InvalidPointOnCurve":
+            "invalid point on curve",
+        "BRepCheck_InvalidCurveOnSurface":
+            "invalid curve on surface",
+        "BRepCheck_CheckFail":
+            "OCCT shape-check failed (internal error)",
+        "BRepCheck_InvalidWire":
+            "invalid wire",
+        "BRepCheck_InvalidRange":
+            "invalid parameter range",
+        "BRepCheck_InvalidToleranceValue":
+            "invalid tolerance value",
+        "BRepCheck_RedundantEdge":
+            "redundant edge",
+        "BRepCheck_RedundantFace":
+            "redundant face",
+        "BRepCheck_InvalidImbricationOfShells":
+            "invalid shell nesting",
+        "BRepCheck_SubshapeNotInShape":
+            "sub-shape not in parent shape",
+    }
+
+    def _status_name(s):
+        """Extract 'BRepCheck_XxxYyy' string from an OCP enum value.
+
+        OCP 7.8 formats the enum as 'BRepCheck_Status.BRepCheck_NotClosed'
+        (no angle brackets); older or debug builds may include '<...>'.
+        We take the last dot-separated component in all cases.
+        """
+        raw = str(s).strip("<>").split(":")[0].strip()
+        return raw.split(".")[-1]
+
+    def _collect_status_names(result):
+        """Iterate a BRepCheck_ListOfStatus, return set of status name strings."""
+        names = set()
+        sl = result.Status()
+        try:
+            for s in sl:                    # OCP wraps most NCollection_List as iterable
+                names.add(_status_name(s))
+        except TypeError:
+            # Fallback: 1-based Value() access
+            for i in range(sl.Extent()):
+                try:
+                    names.add(_status_name(sl.Value(i + 1)))
+                except Exception:
+                    pass
+        return names
+
+    # ── Load file ─────────────────────────────────────────────────────────────
+    print("=" * 70)
+    print(f"SOLID INTEGRITY CHECK  ({step_file})")
+    print("=" * 70)
+
+    try:
+        compound = cq.importers.importStep(str(step_file))
+    except Exception as exc:
+        print(f"  ERROR: Cannot load STEP file: {exc}")
+        return False
+
+    solids = compound.solids().vals()
+    n_solids = len(solids)
+    print(f"  Solids: {n_solids}")
+    if n_solids == 0:
+        print("  ERROR: No solids found in file.")
+        return False
+    print()
+
+    global_fatal = 0
+    global_warn  = 0
+    global_ok    = 0
+    # For large compounds, suppress OK-solid lines to avoid noise
+    compact = n_solids > 20
+
+    for idx, solid in enumerate(solids, 1):
+        fatals = []   # (label, description) — would break slicing
+        warns  = []   # (label, description) — slicer-dependent
+
+        # ── Check 1: BRepCheck_Analyzer ───────────────────────────────
+        try:
+            ana = BRepCheck_Analyzer(solid.wrapped, True)
+            if not ana.IsValid():
+                seen = set()
+                for sub_type in (TopAbs_SHELL, TopAbs_FACE,
+                                  TopAbs_EDGE, TopAbs_VERTEX):
+                    exp = TopExp_Explorer(solid.wrapped, sub_type)
+                    while exp.More():
+                        sub = exp.Current()
+                        try:
+                            seen |= _collect_status_names(ana.Result(sub))
+                        except Exception:
+                            pass
+                        exp.Next()
+
+                for name in seen:
+                    if name == "BRepCheck_NoError":
+                        continue
+                    desc = _DESC.get(name, name)
+                    if name in _FATAL_NAMES:
+                        fatals.append((name, desc))
+                    else:
+                        warns.append((name, desc))
+        except Exception as exc:
+            warns.append(("BRepCheck_Analyzer", f"check raised: {exc}"))
+
+        # ── Check 2: ShapeAnalysis_ShapeContents ──────────────────────
+        n_shells = n_faces = free_edges = free_faces = 0
+        try:
+            contents = ShapeAnalysis_ShapeContents()
+            contents.Perform(solid.wrapped)
+            n_shells   = contents.NbShells()
+            n_faces    = contents.NbFaces()
+            free_edges = contents.NbFreeEdges()
+            free_faces = contents.NbFreeFaces()
+            if free_edges > 0:
+                fatals.append(("FreeEdges",
+                    f"{free_edges} free edge(s) — non-manifold / open shell"))
+            if free_faces > 0:
+                fatals.append(("FreeFaces",
+                    f"{free_faces} free face(s) — disconnected geometry"))
+        except Exception as exc:
+            warns.append(("ShapeAnalysis", f"check raised: {exc}"))
+
+        # ── Check 3: Volume sign ──────────────────────────────────────
+        vol_str = "?"
+        try:
+            props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(solid.wrapped, props)
+            vol = props.Mass()
+            vol_str = f"{vol:.1f} mm³"
+            if vol < 0:
+                fatals.append(("NegativeVolume",
+                    f"volume = {vol:.2f} mm³ — faces oriented inward"))
+            elif vol == 0:
+                fatals.append(("ZeroVolume", "zero volume — degenerate solid"))
+        except Exception as exc:
+            warns.append(("Volume", f"check raised: {exc}"))
+
+        # ── Check 4: Self-intersection (optional) ─────────────────────
+        if check_intersections:
+            try:
+                from OCP.BRepAlgoAPI import BRepAlgoAPI_Check
+                chk = BRepAlgoAPI_Check(solid.wrapped, False, True)
+                chk.Perform()
+                if not chk.IsValid():
+                    fatals.append(("SelfIntersection",
+                        "solid self-intersects (BRepAlgoAPI_Check)"))
+            except Exception as exc:
+                warns.append(("SelfIntersection", f"check raised: {exc}"))
+
+        # ── Per-solid report ──────────────────────────────────────────
+        tag = "FAIL" if fatals else ("WARN" if warns else "OK  ")
+        if fatals or warns:
+            print(f"  [{tag}] solid {idx:3d}/{n_solids}"
+                  f"  vol={vol_str}  shells={n_shells}  faces={n_faces}")
+            for lbl, desc in sorted(set(fatals)):
+                print(f"           FATAL  {lbl}: {desc}")
+            for lbl, desc in sorted(set(warns)):
+                print(f"           WARN   {lbl}: {desc}")
+        elif not compact:
+            print(f"  [{tag}] solid {idx:3d}/{n_solids}"
+                  f"  vol={vol_str}  shells={n_shells}  faces={n_faces}")
+        else:
+            global_ok += 1
+
+        global_fatal += len(fatals)
+        global_warn  += len(warns)
+
+    # ── Summary ───────────────────────────────────────────────────────
+    if global_ok:
+        print(f"  [OK  ] ({global_ok} solid(s) with no issues — omitted)")
+    print()
+    if global_fatal:
+        print(f"  RESULT: {global_fatal} fatal issue(s), {global_warn} warning(s)"
+              f" across {n_solids} solid(s).")
+        print("  Slicing is likely to fail.  Recommended actions:")
+        print("    • Re-run with --union to fuse all hubs into one manifold solid.")
+        print("    • Open in FreeCAD → Part → Check Geometry for an interactive report.")
+        print("    • Use MeshMixer or Netfabb repair on the STL export.")
+    elif global_warn:
+        print(f"  RESULT: 0 fatal, {global_warn} warning(s).  "
+              "File may import with slicer warnings.")
+    else:
+        print(f"  RESULT: All {n_solids} solid(s) passed.  "
+              "File should slice cleanly.")
+    print("=" * 70)
+    return global_fatal == 0
 
 
 def export_model(shape, filepath, fmt="step"):
@@ -1099,10 +1287,10 @@ def main():
         description=(
             "Generate solid BREP CAD files (STEP or STL) of ball-and-stick\n"
             "molecular models from molecular geometry files.\n\n"
-            "Architecture: one hub solid per atom (sphere fused with all bond\n"
-            "tubes), with OCCT rolling-ball fillets at every sphere-tube\n"
-            "junction.  The result is a compound of overlapping hub solids\n"
-            "that can be unioned in any STEP-capable CAD program."
+            "Architecture: all sphere and cylinder primitives fused in one\n"
+            "BRepAlgoAPI_Fuse call (multi-tool mode) to produce a single\n"
+            "BREP solid.  Use --no-fillet for a compound of overlapping\n"
+            "primitives (no boolean, always valid STEP)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=r"""
@@ -1114,8 +1302,6 @@ SCALE CONVENTION
 
   Bond tube diameter    =  VdW_H(1.2 A) * --bond-scale * --scale
                         =  defaults give 8.4 mm diameter (bond-scale 0.7)
-
-  Fillet radius         =  tube_radius * 0.3  (auto, or set with --fillet-size)
 
 JUNCTION GEOMETRY
   At each sphere-tube junction the key metrics are:
@@ -1147,8 +1333,7 @@ WORKFLOW
         python mol2step.py molecule.cjson --check-step molecule.step
 
   4.  Open in FreeCAD or OnShape:
-        Part > Boolean > Union all bodies -> one solid
-        Add fillets/chamfers, support struts, base plate as needed
+        Inspect solid, add support struts or base plate as needed
 
   5.  Export STL / 3MF and slice in PrusaSlicer
 
@@ -1158,9 +1343,6 @@ EXAMPLES
 
   # Smaller atoms and thinner bonds (good for larger molecules)
   python mol2step.py molecule.cjson --vdw-scale 0.7 --bond-scale 0.5
-
-  # Custom fillet size
-  python mol2step.py molecule.cjson --fillet-size 0.5
 
   # Print sizing table without building
   python mol2step.py molecule.cjson --info
@@ -1183,7 +1365,6 @@ PARAMETER GUIDE FOR 3D PRINTING
   --scale          10.0      mm per Angstrom; increase for larger print
   --vdw-scale      1.0       atom sphere size multiplier
   --bond-scale     0.7       bond tube size multiplier (0.5-0.7 recommended)
-  --fillet-size    auto      rolling-ball fillet radius; auto = tube_r * 0.3
   --bond-tolerance 0.4       Angstrom tolerance for bond inference (XYZ/PDB)
 
   Rule of thumb: bond-scale 0.5-0.7 keeps tubes noticeably thinner than atom
@@ -1191,9 +1372,10 @@ PARAMETER GUIDE FOR 3D PRINTING
   overlap and angle are printed at build time — look for "ok" on all elements.
 """)
 
-    # Positional
-    p.add_argument("input",
-                   help="Molecule file (.mol .sdf .xyz .pdb .cjson)")
+    # Positional — optional when --check-integrity is the only goal
+    p.add_argument("input", nargs="?", default=None,
+                   help="Molecule file (.mol .sdf .xyz .pdb .cjson); "
+                        "not required when using --check-integrity alone")
 
     # Output
     p.add_argument("-o", "--output",
@@ -1214,17 +1396,18 @@ PARAMETER GUIDE FOR 3D PRINTING
     # Geometry overrides
     p.add_argument("--tube-radius", type=float, default=None,
                    help="Hard-override tube radius in mm (overrides --bond-scale)")
-    p.add_argument("--fillet-size", type=float, default=None,
-                   help="Rolling-ball fillet radius in mm "
-                        "(default: tube_radius * 0.3)")
     p.add_argument("--no-fillet", action="store_true",
-                   help="Skip filleting; export raw fused sphere+tube hubs")
+                   help="Export raw overlapping sphere+cylinder compound "
+                        "(no boolean union)")
     p.add_argument("--union", action="store_true",
                    help="Boolean-union all hub solids into a single solid before "
                         "export (slower but produces one manifold body)")
     p.add_argument("--bond-tolerance", type=float, default=0.4,
                    help="Bond-inference distance tolerance in Angstroms "
                         "for XYZ/PDB files (default: 0.4)")
+    p.add_argument("--min-bond-dist", type=float, default=MIN_BOND_DIST,
+                   help=f"Minimum interatomic distance (Å) treated as a bond "
+                        f"during inference (default: {MIN_BOND_DIST})")
 
     # Base plate
     p.add_argument("--add-base", action="store_true",
@@ -1249,6 +1432,14 @@ PARAMETER GUIDE FOR 3D PRINTING
                    help="Analyse junction geometry (overlap and angle) for "
                         "every bond endpoint in STEP_FILE and report; "
                         "also verifies body count.  No build needed.")
+    p.add_argument("--check-integrity", metavar="STEP_FILE",
+                   help="Run OCCT BREP integrity checks on STEP_FILE: topology "
+                        "validity (BRepCheck_Analyzer), free edges/faces "
+                        "(ShapeAnalysis), and volume sign.  Reports FATAL / WARN "
+                        "issues per solid.  No build needed.")
+    p.add_argument("--check-self-intersect", action="store_true",
+                   help="Add self-intersection test to --check-integrity "
+                        "(slow: O(n²) in face count; use on small files only)")
     p.add_argument("--probe-depth", type=float, default=0.5,
                    help=argparse.SUPPRESS)   # legacy, kept for compat
     p.add_argument("--probe-samples", type=int, default=12,
@@ -1256,8 +1447,17 @@ PARAMETER GUIDE FOR 3D PRINTING
 
     args = p.parse_args()
 
+    # --check-integrity doesn't need a molecule file
+    if args.check_integrity and args.input is None:
+        check_solid_integrity(args.check_integrity,
+                              check_intersections=args.check_self_intersect)
+        return
+
+    if args.input is None:
+        p.error("input file is required unless --check-integrity is used alone")
+
     print(f"Loading: {args.input}")
-    mol = load_molecule(args.input, args.bond_tolerance)
+    mol = load_molecule(args.input, args.bond_tolerance, args.min_bond_dist)
     if validate_molecule(mol) > 0:
         print("  (warnings above may cause geometry errors — review input file)")
     if not args.no_center:
@@ -1285,9 +1485,6 @@ PARAMETER GUIDE FOR 3D PRINTING
     print(f"\n  Bounding box: {bb_min.round(2)} to {bb_max.round(2)} A")
     print(f"  Model extent: {ext[0]:.1f} x {ext[1]:.1f} x {ext[2]:.1f} mm")
 
-    if args.info and not args.debug:
-        return
-
     if args.check_step:
         check_step_gaps(args.check_step, mol,
                         args.scale, args.vdw_scale, args.bond_scale,
@@ -1296,11 +1493,17 @@ PARAMETER GUIDE FOR 3D PRINTING
                         probe_depth=args.probe_depth)
         return
 
+    if args.check_integrity:
+        check_solid_integrity(args.check_integrity,
+                              check_intersections=args.check_self_intersect)
+        return
+
     if args.debug:
         validate_geometry(mol, args.scale, args.vdw_scale, args.bond_scale,
                           args.tube_radius)
-        if args.info:
-            return
+
+    if args.info:
+        return
 
     if not mol.bonds:
         print("\nERROR: No bonds found.  For XYZ/PDB files try "
@@ -1314,20 +1517,20 @@ PARAMETER GUIDE FOR 3D PRINTING
     print(f"\nBuilding model...")
     shape = build_model(
         mol, args.scale, args.vdw_scale, args.bond_scale,
-        args.tube_radius, args.fillet_size, args.no_fillet,
+        args.tube_radius, None, args.no_fillet,
         args.add_base, args.base_thickness, args.base_margin,
         args.union)
 
     print(f"  Exporting: {args.output}")
     export_model(shape, args.output, args.format)
     print(f"Done -> {args.output}")
-    if args.union:
-        print(f"\n  Output is a single unified solid.")
-    else:
-        print(f"\n  The STEP compound contains one hub solid per atom.")
+    if args.no_fillet:
+        print(f"\n  The STEP compound contains one body per sphere/cylinder.")
         print(f"  To get a single solid in CAD:")
         print(f"    FreeCAD : select all bodies -> Part -> Boolean -> Union")
         print(f"    OnShape : select all -> Boolean -> Union")
+    else:
+        print(f"\n  Output is a single fused solid.")
 
 
 if __name__ == "__main__":
