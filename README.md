@@ -1,9 +1,9 @@
-# mol2step — Molecular Geometry to Solid CAD (STEP/STL)
+# mol2step — Molecular Geometry to Solid CAD (STEP/BREP/STL)
 
 Generate true solid BREP CAD files of ball-and-stick molecular models from
-molecular geometry files.  Produces real sphere-and-cylinder geometry with
-OCCT rolling-ball fillets that imports cleanly into FreeCAD, OnShape, or any
-STEP-compatible CAD program for further modification before 3D printing.
+molecular geometry files.  Produces real sphere-and-cylinder geometry that
+imports cleanly into FreeCAD, OnShape, or any STEP-compatible CAD program
+for further modification before 3D printing.
 
 ## Why this exists
 
@@ -16,21 +16,25 @@ geometry directly.
 
 ## Architecture
 
-Each atom becomes one **sphere primitive** sized to its van der Waals radius.
-Each bond becomes one or more **cylinder primitives** (one strand per bond
+Each atom becomes one **sphere** sized to its van der Waals radius.
+Each bond becomes one or more **cylinder** primitives (one strand per bond
 order) sized to the hydrogen VdW radius times `--bond-scale`.
+
+### STEP output
+
+Atoms are written as true **`SPHERICAL_SURFACE`** entities with a
+**`VERTEX_LOOP`** boundary (a single south-pole point) — no seam edges,
+no degenerate pole edges, no boolean fuse required.  Each bond cylinder is
+walked from OCCT topology and emitted as a `CYLINDRICAL_SURFACE` solid.
+The result is one STEP file containing N_atoms + N_bond_strands separate
+`MANIFOLD_SOLID_BREP` bodies.
+
+### BREP / STL output
 
 All sphere and cylinder primitives are collected into a flat list and fused
 in a **single `BRepAlgoAPI_Fuse` call** (multi-tool mode) to produce one
-solid BREP body.  This avoids the incremental pairwise orientation artefacts
-that occur when fusing solids one-by-one.
-
-`--no-fillet` skips the boolean entirely and exports a `Compound` of the raw
-overlapping primitives — always valid STEP, useful as a quick preview or when
-the fuse fails on unusual geometry.
-
-Junction geometry (overlap and angle at every sphere–tube contact) is computed
-analytically from the model parameters at build time and reported as a table.
+solid BREP body.  `--no-fillet` skips the boolean and exports a `Compound`
+of the raw overlapping primitives instead.
 
 ## Pipeline
 
@@ -41,13 +45,14 @@ analytically from the model parameters at build time and reported as a table.
   .cjson / .mol / .xyz / .pdb      ← molecular coordinates + bonds
             │
             ▼
-      mol2step.py (CadQuery)        ← sphere + cylinder primitives → BRepAlgoAPI_Fuse
+      mol2step.py                   ← sphere + cylinder geometry
+            │
+            ├─► .step  (N+M separate MANIFOLD_SOLID_BREP solids — STEP AP214)
+            ├─► .brep  (single fused solid — OCCT native)
+            └─► .stl   (triangulated mesh of fused solid)
             │
             ▼
-         .step file                  ← true BREP: single fused solid
-            │
-            ▼
-    FreeCAD / OnShape                ← add struts/base, fillet edges if desired
+    FreeCAD / OnShape                ← inspect, add struts/base, union if needed
             │
             ▼
        .stl / .3mf
@@ -82,11 +87,11 @@ chmod +x ~/bin/mol2step.py
 ## Quick start
 
 ```bash
-# Generate STEP from a CJSON file (Avogadro2 format)
-python mol2step.py caffeine.cjson -o caffeine.step
+# STEP output — separate sphere+cylinder solids (recommended for CAD import)
+python mol2step.py caffeine.cjson -f step -o caffeine.step
 
-# Check junction geometry before opening in CAD
-python mol2step.py caffeine.cjson --check-step caffeine.step
+# BREP output — single fused solid (recommended for FreeCAD)
+python mol2step.py caffeine.cjson -o caffeine.brep
 
 # Print sizing table without building
 python mol2step.py caffeine.cjson --info
@@ -108,8 +113,16 @@ python mol2step.py <input> [options]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-o / --output` | `<stem>.step` | Output file path |
-| `-f / --format` | `step` | Output format: `step`, `stp`, or `stl` |
+| `-o / --output` | `<stem>.brep` | Output file path |
+| `-f / --format` | `brep` | Output format: `brep` (default), `step`/`stp`, or `stl` |
+
+**Format comparison:**
+
+| Format | Geometry | Bodies | Best for |
+|--------|----------|--------|----------|
+| `brep` | Fused solid (OCCT native) | 1 | FreeCAD editing |
+| `step` | Separate sphere+cylinder solids | N+M | Universal CAD import |
+| `stl`  | Triangulated mesh of fused solid | 1 | Direct slicing |
 
 ### Scale options
 
@@ -119,13 +132,13 @@ python mol2step.py <input> [options]
 | `--vdw-scale` | `1.0` | Atom sphere radius multiplier |
 | `--bond-scale` | `0.7` | Bond tube radius multiplier |
 | `--tube-radius` | — | Hard override for tube radius in mm (bypasses `--bond-scale`) |
-| `--no-fillet` | off | Export raw overlapping sphere+cylinder compound (no boolean union) |
+| `--no-fillet` | off | BREP/STL: export raw overlapping compound instead of fused solid |
 
 ### Base plate
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--add-base` | off | Add a rectangular base plate for bed adhesion |
+| `--add-base` | off | Add a rectangular base plate for bed adhesion (BREP/STL only) |
 | `--base-thickness` | `3.0` | Base plate thickness in mm |
 | `--base-margin` | `5.0` | Base plate margin beyond molecule bounding box in mm |
 
@@ -182,7 +195,7 @@ junction angle — well clear of the gap threshold.
 | `--scale` | 10.0 | 8 – 15 | Increase for larger, more robust print |
 | `--vdw-scale` | 1.0 | 0.6 – 1.0 | 0.7 gives more open structure |
 | `--bond-scale` | 0.7 | 0.5 – 0.7 | Below 0.5 bonds become fragile on FDM |
-| `--no-fillet` | off | — | Export raw compound (no boolean); use for quick preview |
+| `--no-fillet` | off | — | BREP/STL: export raw compound (no boolean); use for quick preview |
 | `--base-thickness` | 3.0 | 2 – 5 | Thicker for larger molecules |
 
 **Minimum printable tube diameter** on FDM is roughly 2 mm.  At `--scale 10`
@@ -216,22 +229,23 @@ obabel -:"caffeine" -O caffeine.mol --gen3d -ipub
 
 ## Post-processing in CAD
 
-After generating the STEP file, open it in FreeCAD or OnShape.
-
-### FreeCAD
-1. **File → Open** the `.step` file
-2. The model arrives as a single solid body — no union step needed
+### FreeCAD (BREP — single solid)
+1. **File → Open** the `.brep` file
+2. The model arrives as a single solid body — ready for further work
 3. Add support struts or a stand with **Part → Primitives**
-4. Apply **Part → Fillet** on junction edges if desired
-5. **File → Export → STL or 3MF**
+4. **File → Export → STL or 3MF**
+
+### FreeCAD (STEP — multiple solids)
+1. **File → Open** the `.step` file
+2. The model arrives with one body per atom and per bond strand
+3. Select all bodies in the tree, then **Part → Boolean → Union** to merge
+4. Add struts, then **File → Export → STL or 3MF**
 
 ### OnShape
-1. Import the `.step` file (arrives as a single solid in Part Studio)
-2. Use Fillet / Chamfer tools as desired
-3. **Right-click Part → Export → STL or 3MF**
-
-> If you used `--no-fillet`, the file contains one body per primitive.
-> Select all bodies and run **Boolean → Union** before exporting.
+1. Import the `.step` file (arrives as separate bodies in Part Studio)
+2. Use **Boolean → Union** to merge all bodies into one solid
+3. Use Fillet / Chamfer tools as desired
+4. **Right-click Part → Export → STL or 3MF**
 
 ## Troubleshooting
 
@@ -245,13 +259,14 @@ Run `--info` and check the overlap column.  If H shows near-zero overlap,
 `--bond-scale` is too high.  The default 0.7 is chosen to avoid this.  Run
 `--check-step` to get the full junction geometry table.
 
-**Slow build for large molecules**
+**BREP/STL slow to build for large molecules**
 The `BRepAlgoAPI_Fuse` of all primitives in one call is the bottleneck.
-Use `--no-fillet` for a quick preview (exports a compound with no boolean).
+Use `--format step` for fast output (no boolean fuse), or `--no-fillet` for
+a quick BREP preview compound.
 
 **OnShape import fails**
-OnShape handles STEP well but occasionally chokes on very complex boolean
-results.  Try opening in FreeCAD first, running **Part → Check Geometry**,
+OnShape handles STEP well but occasionally chokes on very complex results.
+Try opening in FreeCAD first, running **Part → Check Geometry**,
 then re-exporting as STEP.
 
 ## Supported input formats
